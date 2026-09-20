@@ -59,7 +59,10 @@ async def widget_index() -> FileResponse:
     авторизации на этом уровне: X-Vibe-Authorization нужен только для
     запросов к /api/portals/*, которые делает уже JS внутри неё.
     """
-    return FileResponse(WIDGET_INDEX_PATH)
+    # no-cache: HTML виджета не должен кэшироваться браузером/обёрткой
+    # placement — иначе после деплоя пользователь будет видеть старый
+    # интерфейс до ручной очистки кэша (см. фикс кэш-путаницы).
+    return FileResponse(WIDGET_INDEX_PATH, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/api/me")
