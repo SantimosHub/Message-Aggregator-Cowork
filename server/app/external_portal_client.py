@@ -1,14 +1,16 @@
 """
 Проверка credentials внешнего портала при подключении (Этап 3, PLAN.md).
 
-Два способа авторизации внешнего портала (README, раздел 2):
-- `vibe_api` — личный ключ Вайбкод, выпущенный НА ВНЕШНЕМ портале. Проверяем
-  через GET /v1/me на той же платформе Вайбкод (общий для всех порталов
-  https://vibecode.bitrix24.tech) — она сама определяет, какому порталу
-  принадлежит ключ, по самому ключу.
-- `webhook` — обычный входящий вебхук Битрикс24. Проверяем прямым вызовом
-  метода `profile` по URL вебхука (это уже не Vibe API, а сырой REST
-  Битрикс24 — см. README, раздел 4.2, п.2).
+Единственный способ авторизации внешнего портала — `webhook` (обычный
+входящий вебхук Битрикс24). Проверяем прямым вызовом метода `profile` по
+URL вебхука (сырой REST Битрикс24 — см. README, раздел 4.2, п.2).
+
+Способ через личный ключ Вайбкод (`vibe_api`), выпущенный НА ВНЕШНЕМ
+портале, был убран: контракт прокси-эндпоинта `/v1/batch`, через который
+шли бы вызовы, не проверен вживую, а сам способ не позволял узнать
+числовой ID сотрудника на внешнем портале (нужен для пометки "своих"
+сообщений прочитанными, см. db.py, owner_external_user_id) — GET /v1/me
+на платформе Вайбкод без Bearer описывает сам ключ, а не пользователя.
 
 ВАЖНО про webhook-запросы: обнаружен воспроизводимый обрыв соединения
 (ERR_HTTP2_PROTOCOL_ERROR/502 на уровне Gateway, БЕЗ долёта до нашего кода)
@@ -18,52 +20,17 @@
 несуществующий/сторонний домен — работал нормально). Похоже на платформенную
 особенность туннеля Gateway. Обходной путь — синхронный `requests` в отдельном
 потоке (`asyncio.to_thread`) вместо `httpx.AsyncClient` для запросов на ПРОИЗВОЛЬНЫЕ
-внешние Битрикс24-порталы (для запросов на саму vibecode.bitrix24.tech проблема
-не проявлялась, там `httpx.AsyncClient` оставлен как есть).
+внешние Битрикс24-порталы.
 """
 from __future__ import annotations
 
 import asyncio
 
-import httpx
 import requests
-
-VIBE_API_BASE_URL = "https://vibecode.bitrix24.tech"
 
 
 class ExternalPortalCredentialsError(Exception):
     """Невалидные credentials внешнего портала — понятная ошибка для ответа виджету."""
-
-
-async def validate_vibe_api_key(key: str) -> dict:
-    """
-    Проверяет личный ключ vibe_api_... внешнего портала: GET /v1/me.
-    Требования (README, раздел 8): скоуп `im` обязателен, режим — «Только чтение».
-    Возвращает сырые данные ответа (portal, scopes, accessMode) для логирования/отображения.
-    """
-    async with httpx.AsyncClient(base_url=VIBE_API_BASE_URL, timeout=15) as client:
-        resp = await client.get("/v1/me", headers={"X-Api-Key": key})
-
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise ExternalPortalCredentialsError(
-            "Платформа Вайбкод вернула не-JSON ответ при проверке ключа"
-        ) from exc
-
-    if resp.status_code >= 400 or not data.get("success", True):
-        error = data.get("error", {})
-        raise ExternalPortalCredentialsError(
-            f"Ключ невалиден: {error.get('code', 'UNKNOWN')} — {error.get('message', data)}"
-        )
-
-    payload = data["data"]
-    scopes = payload.get("scopes", [])
-    if "im" not in scopes:
-        raise ExternalPortalCredentialsError(
-            f"У ключа нет скоупа 'im' (есть только {scopes}) — не сможем читать сообщения"
-        )
-    return payload
 
 
 def _sync_get_json(url: str) -> tuple[int, dict | None, str]:

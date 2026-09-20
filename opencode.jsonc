@@ -1,0 +1,106 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "b24cowork",
+  "mcp": {
+    "openwork-browser": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64883/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:B24_COWORK_MCP_TOKEN}"
+      }
+    },
+    "chrome": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64884/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:B24_COWORK_MCP_TOKEN}"
+      }
+    },
+    "bitrix24": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64886/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:B24_COWORK_MCP_TOKEN}"
+      }
+    },
+    "attachments": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64888/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:B24_COWORK_MCP_TOKEN}"
+      }
+    },
+    "memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64891/mcp/project/v1/mzIO0O7Ox1tq-i_srGI87GT77fePFjmdaWGx9R_20dg",
+      "headers": {
+        "Authorization": "Bearer {env:B24_COWORK_MCP_TOKEN}"
+      }
+    },
+    "b24-cowork-memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64890/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:B24_COWORK_MCP_TOKEN}"
+      }
+    }
+  },
+  "agent": {
+    "b24cowork": {
+      "tools": {
+        "memory_*": false,
+        "b24-cowork-memory_*": true
+      },
+      "permission": {
+        "memory_*": "deny",
+        "b24-cowork-memory_*": "allow"
+      }
+    },
+    "code": {
+      "tools": {
+        "memory_*": true,
+        "b24-cowork-memory_*": false
+      },
+      "permission": {
+        "memory_*": "allow",
+        "b24-cowork-memory_*": "deny"
+      }
+    }
+  },
+  "permission": {
+    "*": "allow",
+    "bash": {
+      "*": "allow",
+      "rm *": "ask",
+      "* rm *": "ask",
+      "*/rm *": "ask",
+      "rmdir *": "ask",
+      "* rmdir *": "ask",
+      "*/rmdir *": "ask",
+      "mv *": "ask",
+      "* mv *": "ask",
+      "*/mv *": "ask",
+      "shred *": "ask",
+      "* shred *": "ask",
+      "*/shred *": "ask",
+      "truncate *": "ask",
+      "* truncate *": "ask",
+      "*/truncate *": "ask",
+      "git clean*": "ask",
+      "* git clean*": "ask",
+      "*/git clean*": "ask",
+      "git reset --hard*": "ask",
+      "* git reset --hard*": "ask",
+      "*/git reset --hard*": "ask",
+      "git checkout -- *": "ask",
+      "* git checkout -- *": "ask",
+      "*/git checkout -- *": "ask",
+      "dd *of=*": "ask",
+      "* dd *of=*": "ask",
+      "*/dd *of=*": "ask",
+      "* -delete*": "ask"
+    },
+    "doom_loop": "ask",
+    "bitrix24_bitrix_call_confirmed": "ask"
+  }
+}

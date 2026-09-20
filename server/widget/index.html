@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Message Aggregator — внешние порталы</title>
+<style>
+  /* ---------- Дизайн-токены (Этап 6, PLAN.md) ---------- */
+  :root {
+    --bg: #F7F8FB;
+    --surface: #FFFFFF;
+    --border: #E4E7EE;
+    --text: #171B26;
+    --text-muted: #6B7280;
+    --accent: #4F46E5;
+    --accent-soft: #EEF0FF;
+    --accent-hover: #4338CA;
+    --ok: #16A34A;
+    --ok-soft: #ECFDF3;
+    --error: #DC2626;
+    --error-soft: #FEF2F2;
+    --disabled: #9CA3AF;
+    --disabled-soft: #F3F4F6;
+    --radius: 12px;
+    --font-display: 'Space Grotesk', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    --font-body: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 28px 20px 60px;
+  }
+
+  @media (max-width: 480px) {
+    .page { padding: 18px 14px 48px; }
+  }
+
+  /* ---------- Header ---------- */
+  .header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .header h1 {
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+
+  .header p {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 13px;
+    max-width: 38ch;
+  }
+
+  button {
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    border: none;
+    border-radius: 8px;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+    padding: 9px 16px;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background 0.15s ease;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary:disabled { background: var(--disabled); cursor: default; }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-muted);
+    padding: 8px 12px;
+    font-weight: 500;
+  }
+  .btn-ghost:hover { color: var(--text); background: var(--disabled-soft); }
+
+  .btn-danger-text {
+    background: transparent;
+    color: var(--text-muted);
+    padding: 6px 10px;
+    font-weight: 500;
+    border-radius: 6px;
+  }
+  .btn-danger-text:hover { color: var(--error); background: var(--error-soft); }
+  .btn-danger-text.confirming { color: var(--error); background: var(--error-soft); }
+
+  /* ---------- Форма добавления ---------- */
+  .add-form {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    margin-bottom: 20px;
+    display: none;
+  }
+  .add-form.open { display: block; }
+
+  .field { margin-bottom: 14px; }
+  .field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+
+  .field input[type="text"] {
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+  }
+  .field input[type="text"]:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-color: var(--accent);
+  }
+
+  .field .hint {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-body);
+  }
+
+  .field .hint ol {
+    margin: 4px 0 0;
+    padding-left: 16px;
+  }
+  .field .hint li {
+    margin-top: 2px;
+  }
+  .field .hint code {
+    font-size: 11px;
+  }
+
+  .segmented {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .segmented button {
+    background: var(--surface);
+    color: var(--text-muted);
+    padding: 8px 14px;
+    font-weight: 600;
+    border-radius: 0;
+  }
+  .segmented button.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .segmented button:not(:last-child) { border-right: 1px solid var(--border); }
+
+  .form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .form-error {
+    background: var(--error-soft);
+    color: var(--error);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    margin-bottom: 14px;
+    display: none;
+  }
+  .form-error.visible { display: block; }
+
+  /* ---------- Список порталов ---------- */
+  .list { display: flex; flex-direction: column; gap: 10px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .status-dot.active { background: var(--ok); }
+  .status-dot.error { background: var(--error); }
+  .status-dot.disabled { background: var(--disabled); }
+  .status-dot.connecting { background: var(--accent); }
+
+  /* Сигнатурный элемент: пульсация у активных порталов — портал реально
+     опрашивается фоновой задачей каждые ~45 сек (см. server/app/poller.py) */
+  .status-dot.active::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    background: var(--ok);
+    opacity: 0.35;
+    animation: pulse 2s ease-out infinite;
+  }
+  /* У 'connecting' пульсация быстрее и заметнее — визуально это "процесс
+     в работе", а не устойчивое состояние, как у active */
+  .status-dot.connecting::after {
+    content: "";
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.45;
+    animation: pulse 1s ease-out infinite;
+  }
+  @keyframes pulse {
+    0%   { transform: scale(1);   opacity: 0.35; }
+    100% { transform: scale(2.2); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .status-dot.active::after,
+    .status-dot.connecting::after { animation: none; opacity: 0; }
+  }
+
+  .card-body { flex: 1; min-width: 0; }
+
+  .card-domain {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .card-meta {
+    margin-top: 3px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .chip {
+    background: var(--disabled-soft);
+    color: var(--text-muted);
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-weight: 600;
+    font-size: 11px;
+  }
+
+  .status-text { font-weight: 500; }
+  .status-text.active { color: var(--ok); }
+  .status-text.error { color: var(--error); }
+  .status-text.disabled { color: var(--disabled); }
+  .status-text.connecting { color: var(--accent); }
+
+  .card-error-hint {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  /* ---------- Пустое состояние ---------- */
+  .empty-state {
+    text-align: center;
+    padding: 56px 20px;
+    color: var(--text-muted);
+  }
+  .empty-state svg { margin-bottom: 14px; opacity: 0.6; }
+  .empty-state h2 {
+    font-family: var(--font-display);
+    font-size: 16px;
+    color: var(--text);
+    margin: 0 0 6px;
+  }
+  .empty-state p { margin: 0 0 18px; font-size: 13px; }
+
+  /* ---------- Скелетон загрузки ---------- */
+  .skeleton { display: flex; flex-direction: column; gap: 10px; }
+  .skeleton-card {
+    height: 58px;
+    border-radius: var(--radius);
+    background: linear-gradient(90deg, var(--surface) 25%, var(--disabled-soft) 37%, var(--surface) 63%);
+    background-size: 400% 100%;
+    animation: shimmer 1.4s ease infinite;
+    border: 1px solid var(--border);
+  }
+  @keyframes shimmer {
+    0% { background-position: 100% 50%; }
+    100% { background-position: 0 50%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .skeleton-card { animation: none; }
+  }
+
+  /* ---------- Ошибка загрузки списка ---------- */
+  .load-error {
+    background: var(--error-soft);
+    color: var(--error);
+    border-radius: var(--radius);
+    padding: 16px;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="header">
+    <div>
+      <h1>Подключённые порталы</h1>
+      <p>Сообщения из подключенных порталов будут приходить в отдельный чат на вашем портале.</p>
+    </div>
+    <button class="btn-primary" id="toggle-form-btn" type="button">+ Подключить портал</button>
+  </div>
+
+  <form class="add-form" id="add-form" novalidate>
+    <div class="form-error" id="form-error" role="alert"></div>
+
+    <div class="field">
+      <label for="domain-input">Название портала</label>
+      <input type="text" id="domain-input" name="domain" placeholder="example.bitrix24.ru" autocomplete="off" />
+      <div class="hint" id="domain-hint">Отличительное название портала, чтобы вы понимали, с какого портала пришло сообщение.</div>
+    </div>
+
+    <div class="field">
+      <label for="credentials-input" id="credentials-label">URL вебхука</label>
+      <input type="text" id="credentials-input" name="credentials" placeholder="https://портал.bitrix24.ru/rest/1/токен/" autocomplete="off" />
+      <div class="hint" id="credentials-hint">
+        Как создать вебхук на портале-источнике:
+        <ol>
+          <li>Раздел «Разработчикам» → «Другое» → «Входящий вебхук»</li>
+          <li>В разделе настройка прав выберите следующие права: <code>Чат и уведомления (im)</code> и <code>Открытые линии (imopenlines)</code></li>
+          <li>Скопируйте выданную ссылку целиком, вместе со слэшем на конце</li>
+          <li>Нажмите кнопку создать</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="form-actions">
+      <button type="button" class="btn-ghost" id="cancel-form-btn">Отмена</button>
+      <button type="submit" class="btn-primary" id="submit-btn">Подключить</button>
+    </div>
+  </form>
+
+  <div id="content">
+    <div class="skeleton" id="skeleton">
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var API_BASE = "/api/portals";
+  var MAX_RETRIES = 4; // с retryAfter=3с из ответа платформы это ~12 сек максимум ожидания
+
+  /**
+   * Обёртка над fetch с автоповтором на BH_APP_STARTING (503 с полем
+   * retryAfter в теле) — платформенный сигнал "туннель поднят, но
+   * приложение ещё не отвечает, повтори через N секунд". Без этого
+   * повтора любой холодный старт/переподключение туннеля после деплоя
+   * или перепривязки ключа сразу показывался бы пользователю как ошибка,
+   * хотя на самом деле нужно было просто подождать несколько секунд.
+   */
+  function fetchWithRetry(url, options, attempt) {
+    attempt = attempt || 0;
+    return fetch(url, options).then(function (resp) {
+      if (resp.status === 503 && attempt < MAX_RETRIES) {
+        return resp
+          .clone()
+          .json()
+          .catch(function () { return {}; })
+          .then(function (data) {
+            var retryAfterSec = (data.error && data.error.retryAfter) || 2;
+            return new Promise(function (resolve) {
+              setTimeout(resolve, retryAfterSec * 1000);
+            }).then(function () {
+              return fetchWithRetry(url, options, attempt + 1);
+            });
+          });
+      }
+      return resp;
+    });
+  }
+
+  var elContent = document.getElementById("content");
+  var elSkeleton = document.getElementById("skeleton");
+  var elForm = document.getElementById("add-form");
+  var elToggleFormBtn = document.getElementById("toggle-form-btn");
+  var elCancelFormBtn = document.getElementById("cancel-form-btn");
+  var elSubmitBtn = document.getElementById("submit-btn");
+  var elFormError = document.getElementById("form-error");
+  var elDomainInput = document.getElementById("domain-input");
+  var elCredentialsInput = document.getElementById("credentials-input");
+
+  // ---------- Открытие/закрытие формы ----------
+  function openForm() {
+    elForm.classList.add("open");
+    elToggleFormBtn.style.display = "none";
+    elDomainInput.focus();
+  }
+  function closeForm() {
+    elForm.classList.remove("open");
+    elToggleFormBtn.style.display = "";
+    elForm.reset();
+    hideFormError();
+  }
+  elToggleFormBtn.addEventListener("click", openForm);
+  elCancelFormBtn.addEventListener("click", closeForm);
+
+  function showFormError(message) {
+    elFormError.textContent = message;
+    elFormError.classList.add("visible");
+  }
+  function hideFormError() {
+    elFormError.classList.remove("visible");
+  }
+
+  // ---------- Отправка формы ----------
+  elForm.addEventListener("submit", function (e) {
+    e.preventDefault();
+    hideFormError();
+
+    var domain = elDomainInput.value.trim();
+    var credentials = elCredentialsInput.value.trim();
+
+    if (!domain) {
+      showFormError("Укажите домен портала.");
+      elDomainInput.focus();
+      return;
+    }
+    if (!credentials) {
+      showFormError("Укажите URL вебхука.");
+      elCredentialsInput.focus();
+      return;
+    }
+
+    elSubmitBtn.disabled = true;
+    elSubmitBtn.textContent = "Подключаем…";
+
+    fetchWithRetry(API_BASE, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domain: domain, auth_type: "webhook", credentials: credentials })
+    })
+      .then(function (resp) {
+        if (!resp.ok) {
+          return resp.json().catch(function () { return {}; }).then(function (data) {
+            // Наш API отдаёт {detail: "..."}, платформенные ошибки Gateway
+            // (например BH_APP_STARTING, если повторные попытки исчерпаны)
+            // отдают {error: {message: "..."}} — учитываем оба формата.
+            var message = data.detail || (data.error && data.error.message) || "Не удалось подключить портал.";
+            throw new Error(message);
+          });
+        }
+        return resp.json();
+      })
+      .then(function () {
+        closeForm();
+        loadPortals();
+      })
+      .catch(function (err) {
+        showFormError(err.message);
+      })
+      .finally(function () {
+        elSubmitBtn.disabled = false;
+        elSubmitBtn.textContent = "Подключить";
+      });
+  });
+
+  // ---------- Отключение портала ----------
+  function disconnectPortal(portalId, btnEl) {
+    if (!btnEl.classList.contains("confirming")) {
+      btnEl.classList.add("confirming");
+      btnEl.textContent = "Точно отключить?";
+      setTimeout(function () {
+        if (btnEl.classList.contains("confirming")) {
+          btnEl.classList.remove("confirming");
+          btnEl.textContent = "Отключить";
+        }
+      }, 4000);
+      return;
+    }
+
+    btnEl.disabled = true;
+    btnEl.textContent = "Отключаем…";
+
+    fetchWithRetry(API_BASE + "/" + portalId, { method: "DELETE", credentials: "same-origin" })
+      .then(function (resp) {
+        if (!resp.ok && resp.status !== 204) {
+          throw new Error("Не удалось отключить портал.");
+        }
+        loadPortals();
+      })
+      .catch(function () {
+        btnEl.disabled = false;
+        btnEl.classList.remove("confirming");
+        btnEl.textContent = "Отключить";
+      });
+  }
+
+  // ---------- Отрисовка ----------
+  var STATUS_COPY = {
+    connecting: { text: "Подключаем…", hint: "Проверяем доступ и создаём чат — обычно занимает несколько секунд." },
+    active: { text: "Работает", hint: null },
+    error: { text: "Нужно переподключить", hint: "Ключ или вебхук больше не действует." },
+    disabled: { text: "Отключено", hint: null }
+  };
+  var AUTH_TYPE_LABEL = { vibe_api: "Ключ Вайбкод", webhook: "Вебхук" };
+
+  function escapeHtml(str) {
+    var div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  function renderEmptyState() {
+    elContent.innerHTML =
+      '<div class="empty-state">' +
+      '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">' +
+      '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>' +
+      '</svg>' +
+      '<h2>Пока нет подключённых порталов</h2>' +
+      '<p>Добавьте портал — и сообщения оттуда начнут приходить сюда.</p>' +
+      '<button class="btn-primary" id="empty-add-btn" type="button">+ Подключить портал</button>' +
+      '</div>';
+    document.getElementById("empty-add-btn").addEventListener("click", openForm);
+  }
+
+  function renderList(portals) {
+    var html = '<div class="list">';
+    portals.forEach(function (p) {
+      var statusCopy = STATUS_COPY[p.status] || { text: p.status, hint: null };
+      // Реальный текст ошибки из БД (см. mark_portal_error в repositories/external_portals.py)
+      // приоритетнее статичной подсказки — в личном кабинете Вайбкода нет логов приложения,
+      // это единственный способ сотруднику увидеть, что именно пошло не так.
+      var hint = p.error_message ? escapeHtml(p.error_message) : statusCopy.hint;
+      html +=
+        '<div class="card">' +
+        '<span class="status-dot ' + p.status + '"></span>' +
+        '<div class="card-body">' +
+        '<div class="card-domain">' + escapeHtml(p.domain) + '</div>' +
+        '<div class="card-meta">' +
+        '<span class="chip">' + (AUTH_TYPE_LABEL[p.auth_type] || p.auth_type) + '</span>' +
+        '<span class="status-text ' + p.status + '">' + statusCopy.text + '</span>' +
+        '</div>' +
+        (hint ? '<div class="card-error-hint">' + hint + '</div>' : '') +
+        '</div>' +
+        '<button class="btn-danger-text" data-portal-id="' + p.id + '" type="button">Отключить</button>' +
+        '</div>';
+    });
+    html += '</div>';
+    elContent.innerHTML = html;
+
+    elContent.querySelectorAll("[data-portal-id]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        disconnectPortal(btn.getAttribute("data-portal-id"), btn);
+      });
+    });
+  }
+
+  function renderLoadError(message, retry) {
+    elContent.innerHTML =
+      '<div class="load-error">' +
+      '<span>' + escapeHtml(message) + '</span>' +
+      '<button class="btn-ghost" id="retry-btn" type="button" style="color:inherit;">Повторить</button>' +
+      '</div>';
+    document.getElementById("retry-btn").addEventListener("click", retry);
+  }
+
+  // ---------- Загрузка списка ----------
+  // Пока хотя бы один портал в статусе 'connecting' (проверка credentials и
+  // создание чата идут в фоне на сервере — см. server/app/poller.py,
+  // finish_connecting_portal), опрашиваем список повторно, чтобы UI сам
+  // обновился на active/error без перезагрузки страницы.
+  var CONNECTING_POLL_MS = 2500;
+  var connectingPollTimer = null;
+
+  function scheduleConnectingPollIfNeeded(portals) {
+    if (connectingPollTimer) {
+      clearTimeout(connectingPollTimer);
+      connectingPollTimer = null;
+    }
+    var hasConnecting = portals.some(function (p) { return p.status === "connecting"; });
+    if (hasConnecting) {
+      connectingPollTimer = setTimeout(loadPortals, CONNECTING_POLL_MS);
+    }
+  }
+
+  function loadPortals() {
+    fetchWithRetry(API_BASE, { credentials: "same-origin" })
+      .then(function (resp) {
+        if (resp.status === 401) {
+          throw new Error("Похоже, страница открыта не через Битрикс24 — авторизация недоступна.");
+        }
+        if (!resp.ok) {
+          throw new Error("Не удалось загрузить список порталов.");
+        }
+        return resp.json();
+      })
+      .then(function (portals) {
+        if (portals.length === 0) {
+          renderEmptyState();
+        } else {
+          renderList(portals);
+        }
+        scheduleConnectingPollIfNeeded(portals);
+      })
+      .catch(function (err) {
+        renderLoadError(err.message, loadPortals);
+      });
+  }
+
+  loadPortals();
+})();
+</script>
+</body>
+</html>

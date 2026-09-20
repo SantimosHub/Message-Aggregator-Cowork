@@ -55,6 +55,7 @@ EXCLUDE_NAMES = {".env", "__pycache__", ".venv", "venv", ".git", ".pytest_cache"
 # (это ОТДЕЛЬНО от VIBE_API_KEY, который используется только здесь, локально, для деплоя).
 ENV_VARS_TO_FORWARD = [
     "VIBE_APP_KEY",
+    "VIBE_BACKGROUND_API_KEY",
     "VIBE_API_BASE_URL",
     "APP_BASE_URL",
     "PLACEMENT_TITLE",
@@ -171,18 +172,29 @@ def main() -> None:
 
     if existing_server_id:
         print(f"\nШаг 4. Передеплоиваю существующий сервер (id={existing_server_id})...")
-        with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=120) as client:
-            resp = client.post(f"/v1/infra/servers/{existing_server_id}/deploy", headers=headers, json=payload)
-        print(f"  POST /v1/infra/servers/{existing_server_id}/deploy -> {resp.status_code}")
-        data = resp.json()
-        print(f"  Сырой ответ: {data}")
-        if resp.status_code >= 400 or not data.get("success", True):
-            die("редеплой не удался — см. сырой ответ выше")
-        server = data.get("data", data)
+        resp = None
+        try:
+            with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=300) as client:
+                resp = client.post(f"/v1/infra/servers/{existing_server_id}/deploy", headers=headers, json=payload)
+        except httpx.TimeoutException:
+            print(
+                "  Запрос не дождался ответа за 300 сек — но сборка могла всё равно "
+                "запуститься на платформе. Проверяю статус сервера напрямую (Шаг 5), "
+                "не завершая скрипт с ошибкой."
+            )
+
+        server = {}
+        if resp is not None:
+            print(f"  POST /v1/infra/servers/{existing_server_id}/deploy -> {resp.status_code}")
+            data = resp.json()
+            print(f"  Сырой ответ: {data}")
+            if resp.status_code >= 400 or not data.get("success", True):
+                die("редеплой не удался — см. сырой ответ выше")
+            server = data.get("data", data)
         server_id = existing_server_id
     else:
         print("\nШаг 4. Создаю и деплою НОВОЕ galaxy-приложение (POST /v1/infra/servers)...")
-        with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=120) as client:
+        with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=300) as client:
             resp = client.post("/v1/infra/servers", headers=headers, json=payload)
         print(f"  POST /v1/infra/servers -> {resp.status_code}")
         data = resp.json()

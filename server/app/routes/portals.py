@@ -1,15 +1,22 @@
 """
 Этап 3, PLAN.md: подключение внешнего портала сотрудником через виджет.
 
-Поток:
+Поток (ПЕРЕСМОТРЕН — см. Контекст.txt, баг платформы):
 1. Виджет присылает домен + способ авторизации + сами credentials.
-2. Проверяем credentials напрямую у платформы/портала (без сохранения, если невалидны).
-3. При успехе создаём отдельный групповой чат на основном портале (README, раздел 1:
-   "по одному чату на каждый подключённый внешний портал, для каждого сотрудника").
-4. Сохраняем запись в БД со статусом active.
+2. Мы СРАЗУ сохраняем запись в БД со статусом 'connecting' и отвечаем виджету
+   201 — никаких исходящих запросов на этом шаге не делаем.
+3. Проверка credentials, создание отдельного чата на основном портале
+   (README, раздел 1) и переход в 'active'/'error' происходят уже ПОСЛЕ
+   ответа, в poller.finish_connecting_portal — см. докстринг там же.
 
-Ошибки валидации возвращаются как понятный 400 с сообщением — сервер не падает
-(см. PLAN.md, Этап 3, последний пункт).
+Раньше шаги 2 и 3 шли синхронно прямо в этом обработчике: это надёжно рвало
+соединение на уровне туннеля Gateway при исходящем вызове на реальный внешний
+Битрикс24-портал изнутри входящего placement-запроса (см. подробности в
+external_portal_client.py). Внешний вызов ВНУТРИ обработчика запроса от
+Gateway в принципе не делаем — независимо от способа (httpx/requests/поток).
+
+Виджет узнаёт результат через опрос GET /api/portals (см. widget/index.html:
+пока статус 'connecting', список подтягивается каждые несколько секунд).
 """
 from __future__ import annotations
 
@@ -19,18 +26,18 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_owner_user_id
-from ..config import get_settings
-from ..external_portal_client import ExternalPortalCredentialsError, validate_vibe_api_key, validate_webhook
+from ..poller import schedule_finish_connecting
 from ..repositories import external_portals as repo
-from ..vibe_client import VibeApiError, create_group_chat, send_chat_message
 
 router = APIRouter(prefix="/api/portals", tags=["external-portals"])
 
 
 class ConnectPortalRequest(BaseModel):
     domain: str = Field(..., min_length=1, description="Домен внешнего портала, для отображения")
-    auth_type: Literal["vibe_api", "webhook"]
-    credentials: str = Field(..., min_length=1, description="Ключ vibe_api_... или URL вебхука")
+    # Единственный способ авторизации — webhook (см. external_portal_client.py
+    # про то, почему vibe_api как вариант авторизации внешнего портала убран).
+    auth_type: Literal["webhook"] = "webhook"
+    credentials: str = Field(..., min_length=1, description="URL вебхука")
 
 
 class PortalResponse(BaseModel):
@@ -39,6 +46,7 @@ class PortalResponse(BaseModel):
     auth_type: str
     main_chat_id: Optional[int]
     status: str
+    error_message: Optional[str]
     created_at: str
 
     @classmethod
@@ -50,6 +58,7 @@ class PortalResponse(BaseModel):
             auth_type=portal.auth_type,
             main_chat_id=portal.main_chat_id,
             status=portal.status,
+            error_message=portal.error_message,
             created_at=portal.created_at,
         )
 
@@ -66,61 +75,41 @@ async def connect_portal(
     body: ConnectPortalRequest,
     owner_user_id: int = Depends(get_current_owner_user_id),
 ) -> PortalResponse:
-    print(f"[connect_portal] СТАРТ domain={body.domain!r} auth_type={body.auth_type}", flush=True)
-
-    # 1. Валидация credentials — до создания чата и записи в БД.
+    """
+    Сохраняет портал со статусом 'connecting' и сразу отвечает — НИКАКИХ
+    исходящих запросов здесь (см. докстринг модуля). Проверка credentials и
+    создание чата запускаются отдельной задачей, не блокирующей ответ.
+    """
     try:
-        print("[connect_portal] шаг 1: валидация credentials...", flush=True)
-        if body.auth_type == "vibe_api":
-            await validate_vibe_api_key(body.credentials)
-        else:
-            await validate_webhook(body.credentials)
-        print("[connect_portal] шаг 1: OK", flush=True)
-    except ExternalPortalCredentialsError as exc:
-        print(f"[connect_portal] шаг 1: ExternalPortalCredentialsError: {exc}", flush=True)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001 — временная диагностика, ловим ЛЮБОЕ исключение
-        print(f"[connect_portal] шаг 1: НЕОЖИДАННОЕ исключение {type(exc).__name__}: {exc}", flush=True)
+        portal = await repo.create_portal(
+            owner_user_id=owner_user_id,
+            domain=body.domain,
+            auth_type=body.auth_type,
+            credentials=body.credentials,
+        )
+    except HTTPException:
         raise
-
-    # 2. Создание отдельного чата на основном портале для этого сотрудника+портала.
-    settings = get_settings()
-    chat_title = f"{settings.placement_title}: {body.domain}"
-    try:
-        print("[connect_portal] шаг 2: создаю чат...", flush=True)
-        chat_id = await create_group_chat(title=chat_title, user_ids=[owner_user_id])
-        print(f"[connect_portal] шаг 2: OK chat_id={chat_id}", flush=True)
-    except VibeApiError as exc:
-        print(f"[connect_portal] шаг 2: VibeApiError: {exc.payload}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        # По умолчанию необработанное исключение в FastAPI отдаётся как
+        # ПЛОСКИЙ ТЕКСТ "Internal Server Error" без тела JSON — фронтенд не
+        # может показать причину. Ловим здесь и всегда возвращаем JSON.
         raise HTTPException(
-            status_code=502,
-            detail=f"Не удалось создать чат на основном портале: {exc.payload}",
+            status_code=500,
+            detail=f"Внутренняя ошибка сервера: {type(exc).__name__}: {exc}",
         ) from exc
 
-    # 3. Сохранение записи в БД со статусом active.
-    print("[connect_portal] шаг 3: сохраняю в БД...", flush=True)
-    portal = await repo.create_portal(
-        owner_user_id=owner_user_id,
-        domain=body.domain,
-        auth_type=body.auth_type,
-        credentials=body.credentials,
-        main_chat_id=chat_id,
-    )
-    print(f"[connect_portal] шаг 3: OK portal_id={portal.id}", flush=True)
+    # Запускается СРАЗУ после того, как ответ уже сформирован — это
+    # самостоятельная asyncio-задача, а не Starlette BackgroundTasks:
+    # BackgroundTasks выполняются как часть того же цикла отправки ответа
+    # (что для потокового HTTP/2-соединения Gateway может означать, что
+    # исходящий запрос всё ещё технически "внутри" туннелируемого запроса —
+    # то есть тот же обрыв, от которого мы уходим). schedule_finish_connecting
+    # полностью отвязывает задачу от запроса (и удерживает на неё сильную
+    # ссылку — см. poller.py). Поллер (poll_once) на следующем цикле —
+    # страховка, если процесс перезапустится раньше, чем задача успеет
+    # завершиться (см. finish_connecting_portal).
+    schedule_finish_connecting(portal)
 
-    # 4. Приветственное сообщение — не критично для успеха подключения,
-    #    поэтому ошибку отправки только логируем, не роняем запрос.
-    try:
-        print("[connect_portal] шаг 4: отправляю приветственное сообщение...", flush=True)
-        await send_chat_message(
-            chat_id,
-            f"Портал «{body.domain}» подключён. Сюда будут приходить сообщения сотруднику с этого портала.",
-        )
-        print("[connect_portal] шаг 4: OK", flush=True)
-    except VibeApiError as exc:
-        print(f"[connect_portal] шаг 4: VibeApiError (игнорируем): {exc.payload}", flush=True)
-
-    print(f"[connect_portal] ФИНИШ portal_id={portal.id}", flush=True)
     return PortalResponse.from_portal(portal)
 
 
