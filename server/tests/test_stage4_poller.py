@@ -28,6 +28,7 @@ def _portal(**overrides) -> ExternalPortal:
         status="active",
         error_message=None,
         owner_external_user_id=None,
+        chat_mode="separate",
         created_at="2026-01-01 00:00:00",
     )
     defaults.update(overrides)

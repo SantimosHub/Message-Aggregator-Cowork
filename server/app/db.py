@@ -38,11 +38,24 @@ CREATE TABLE IF NOT EXISTS external_portals (
     status               TEXT NOT NULL DEFAULT 'connecting' CHECK (status IN ('connecting', 'active', 'error', 'disabled')),
     error_message        TEXT,
     owner_external_user_id TEXT,
+    chat_mode            TEXT NOT NULL DEFAULT 'separate' CHECK (chat_mode IN ('shared', 'separate')),
     created_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_external_portals_owner
     ON external_portals (owner_user_id);
+
+-- Общий чат «Сборщик сообщений» для каждого сотрудника (один на пользователя).
+-- Создаётся при подключении первого портала и переиспользуется для всех
+-- порталов с chat_mode = 'shared'. Отдельные чаты портала хранятся в
+-- external_portals.main_chat_id (см. poller.py).
+CREATE TABLE IF NOT EXISTS shared_chats (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL UNIQUE,
+    chat_id      INTEGER NOT NULL,
+    title        TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -158,6 +171,22 @@ async def _migrate_owner_external_user_id_column(conn: aiosqlite.Connection) -> 
         await conn.commit()
 
 
+async def _migrate_chat_mode_column(conn: aiosqlite.Connection) -> None:
+    """
+    Добавляет колонку chat_mode, если её ещё нет (для БД, созданных до этой
+    фичи). Старые порталы считаются 'separate' (каждый в своём чате) — это
+    безопасный дефолт, не требующий переноса данных.
+    """
+    async with conn.execute("PRAGMA table_info(external_portals)") as cur:
+        columns = {row[1] async for row in cur}
+    if "chat_mode" not in columns:
+        await conn.execute(
+            "ALTER TABLE external_portals ADD COLUMN chat_mode TEXT NOT NULL DEFAULT 'separate' "
+            "CHECK (chat_mode IN ('shared', 'separate'))"
+        )
+        await conn.commit()
+
+
 async def init_db() -> None:
     """Создаёт таблицы, если их ещё нет. Вызывать один раз при старте приложения."""
     async with get_connection() as conn:
@@ -166,3 +195,4 @@ async def init_db() -> None:
         await _migrate_connecting_status(conn)
         await _migrate_error_message_column(conn)
         await _migrate_owner_external_user_id_column(conn)
+        await _migrate_chat_mode_column(conn)

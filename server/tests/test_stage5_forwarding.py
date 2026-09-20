@@ -28,6 +28,7 @@ def _portal(**overrides) -> ExternalPortal:
         status="active",
         error_message=None,
         owner_external_user_id=None,
+        chat_mode="separate",
         created_at="2026-01-01 00:00:00",
     )
     defaults.update(overrides)
@@ -54,6 +55,8 @@ class TestFormatDigest:
         portal = _portal(domain="ext.example.ru")
         text = _format_digest(portal, [_msg()])
 
+        assert "Портал: ext.example.ru" in text
+        assert "Чат: Support chat" in text
         assert "Иван Петров" in text
         assert "10:15 01.01.2026" in text
         assert "привет" in text
@@ -80,8 +83,15 @@ class TestFormatDigest:
         regular = _format_digest(portal, [_msg(is_open_line=False)])
         open_line = _format_digest(portal, [_msg(is_open_line=True)])
 
-        assert "чат" in regular
-        assert "открытая линия" in open_line
+        assert "Чат: Support chat (чат)" in regular
+        assert "Чат: Support chat (открытая линия)" in open_line
+
+    def test_open_line_author_is_human_readable(self):
+        """Отправитель открытой линии показывается как «Клиент», без сырого id."""
+        portal = _portal()
+        text = _format_digest(portal, [_msg(is_open_line=True, author_name="Клиент")])
+        assert "Клиент" in text
+        assert "Клиент открытой линии" not in text
 
 
 class TestHandleNewMessagesBatching:
@@ -116,8 +126,8 @@ class TestHandleNewMessagesBatching:
         """Один упавший диалог не должен мешать доставке остальных (аналог изоляции ошибок из Этапа 4)."""
         portal = _portal()
         msgs = [
-            _msg(dialog_id="chat_ok", message_id=1),
-            _msg(dialog_id="chat_bad", message_id=2),
+            _msg(dialog_id="chat_ok", dialog_title="chat_ok", message_id=1),
+            _msg(dialog_id="chat_bad", dialog_title="chat_bad", message_id=2),
         ]
 
         async def fake_send(chat_id, text):

@@ -191,7 +191,11 @@ async def _fetch_open_line_messages(
                 is_open_line=True,
                 message_id=msg_id,
                 author_id=str(msg.get("senderid")) if msg.get("senderid") is not None else None,
-                author_name=f"Клиент открытой линии #{msg.get('senderid', '?')}",
+                # Отдельного человекочитаемого имени клиента открытой линии в
+                # imopenlines.session.history.get нет (только числовой senderid),
+                # поэтому вместо сырого id показываем понятную пометку «Клиент»
+                # — название самого чата линии выводится в шапке дайджеста.
+                author_name="Клиент",
                 text=msg.get("text", ""),
                 date=msg.get("date", ""),
             )

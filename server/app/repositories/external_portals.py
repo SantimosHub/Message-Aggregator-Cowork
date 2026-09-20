@@ -22,6 +22,7 @@ AuthType = Literal["webhook"]  # vibe_api как способ авторизац
 # routes/portals.py и poller.finish_connecting_portal — фикс бага Gateway
 # с синхронными исходящими вызовами внутри туннелированного запроса).
 PortalStatus = Literal["connecting", "active", "error", "disabled"]
+ChatMode = Literal["shared", "separate"]
 
 
 @dataclass
@@ -36,6 +37,7 @@ class ExternalPortal:
     status: PortalStatus
     error_message: Optional[str]  # причина последней ошибки подключения/опроса, для UI
     owner_external_user_id: Optional[str]  # ID сотрудника НА ВНЕШНЕМ портале (webhook), для пометки "свои" сообщения прочитанными
+    chat_mode: ChatMode  # 'shared' — в общий чат «Сборщик сообщений», 'separate' — в отдельный чат портала
     created_at: str
 
 
@@ -51,6 +53,7 @@ def _row_to_portal(row: aiosqlite.Row) -> ExternalPortal:
         status=row["status"],
         error_message=row["error_message"],
         owner_external_user_id=row["owner_external_user_id"],
+        chat_mode=row["chat_mode"],
         created_at=row["created_at"],
     )
 
@@ -62,6 +65,7 @@ async def create_portal(
     auth_type: AuthType,
     credentials: str,
     main_chat_id: Optional[int] = None,
+    chat_mode: ChatMode = "separate",
 ) -> ExternalPortal:
     """Создаёт запись о внешнем портале. credentials передаются В ОТКРЫТОМ виде,
     шифруются внутри перед записью в БД.
@@ -75,10 +79,10 @@ async def create_portal(
         cursor = await conn.execute(
             """
             INSERT INTO external_portals
-                (owner_user_id, domain, auth_type, credentials, main_chat_id, last_message_cursor, status)
-            VALUES (?, ?, ?, ?, ?, '{}', 'connecting')
+                (owner_user_id, domain, auth_type, credentials, main_chat_id, last_message_cursor, status, chat_mode)
+            VALUES (?, ?, ?, ?, ?, '{}', 'connecting', ?)
             """,
-            (owner_user_id, domain, auth_type, encrypted, main_chat_id),
+            (owner_user_id, domain, auth_type, encrypted, main_chat_id, chat_mode),
         )
         await conn.commit()
         portal_id = cursor.lastrowid
@@ -205,4 +209,42 @@ async def update_cursor(portal_id: int, cursor: dict[str, str]) -> None:
 async def delete_portal(portal_id: int) -> None:
     async with get_connection() as conn:
         await conn.execute("DELETE FROM external_portals WHERE id = ?", (portal_id,))
+        await conn.commit()
+
+
+async def set_chat_mode(portal_id: int, chat_mode: ChatMode) -> None:
+    """Обновляет chat_mode портала (shared/separate)."""
+    async with get_connection() as conn:
+        await conn.execute(
+            "UPDATE external_portals SET chat_mode = ? WHERE id = ?",
+            (chat_mode, portal_id),
+        )
+        await conn.commit()
+
+
+async def get_shared_chat(owner_user_id: int) -> Optional[int]:
+    """
+    Возвращает chat_id общего чата «Сборщик сообщений» для сотрудника,
+    либо None, если такого чата ещё нет.
+    """
+    async with get_connection() as conn:
+        async with conn.execute(
+            "SELECT chat_id FROM shared_chats WHERE owner_user_id = ?",
+            (owner_user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    return row["chat_id"] if row else None
+
+
+async def create_shared_chat(owner_user_id: int, chat_id: int, title: str) -> None:
+    """Сохраняет созданный общий чат «Сборщик сообщений» для сотрудника."""
+    async with get_connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO shared_chats (owner_user_id, chat_id, title)
+            VALUES (?, ?, ?)
+            ON CONFLICT(owner_user_id) DO UPDATE SET chat_id = excluded.chat_id, title = excluded.title
+            """,
+            (owner_user_id, chat_id, title),
+        )
         await conn.commit()

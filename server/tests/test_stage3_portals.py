@@ -46,9 +46,18 @@ OWNER_ID = 15566
 
 
 def _reset_db() -> None:
-    if _db.exists():
-        _db.unlink()
-    asyncio.run(init_db())
+    async def _clear() -> None:
+        await init_db()  # гарантирует, что таблицы существуют
+        async with get_connection() as conn:
+            await conn.execute("DELETE FROM external_portals")
+            await conn.execute("DELETE FROM shared_chats")
+            await conn.commit()
+
+    # На Windows файл БД может оставаться залоченным между тестами (поллер/
+    # aiosqlite держат соединение), поэтому надёжнее очистить таблицы
+    # DELETE'ом, а не удалять файл с диска. Накопленных записей из прошлых
+    # тестов тогда не остаётся.
+    asyncio.run(_clear())
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +65,10 @@ def fresh_db():
     _reset_db()
     yield
     if _db.exists():
-        _db.unlink()
+        try:
+            _db.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 @pytest.fixture
@@ -110,12 +122,14 @@ class TestConnectPortalWebhook:
                     "domain": "ext.example.ru",
                     "auth_type": "webhook",
                     "credentials": "https://ext.example.ru/rest/1/secret123/",
+                    "chat_mode": "separate",
                 },
             )
             assert resp.status_code == 201, resp.text
             created = resp.json()
             assert created["status"] == "connecting"
             assert created["main_chat_id"] is None
+            assert created["chat_mode"] == "separate"
             assert "credentials" not in created
 
             data = _wait_for_status(client, created["id"])
@@ -144,6 +158,73 @@ class TestConnectPortalWebhook:
         # (см. poller.finish_connecting_portal) — нужен для пометки "своих"
         # сообщений прочитанными (poller._handle_new_messages).
         assert owner_external_user_id == "12810"
+
+    def test_shared_mode_uses_or_creates_shared_chat(self, client):
+        """Первый портал с chat_mode='shared' создаёт общий чат «Сборщик сообщений»."""
+        with (
+            patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
+            patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=777) as chat,
+            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+        ):
+            resp = client.post(
+                "/api/portals",
+                json={
+                    "domain": "shared.ru",
+                    "auth_type": "webhook",
+                    "credentials": "https://shared.ru/rest/1/x/",
+                    "chat_mode": "shared",
+                },
+            )
+            created = resp.json()
+            data = _wait_for_status(client, created["id"])
+
+        assert data["status"] == "active"
+        assert data["main_chat_id"] == 777
+        assert data["chat_mode"] == "shared"
+        chat.assert_called_once()
+        # Название общего чата — это placement_title без суффикса домена
+        # (в отличие от отдельного чата «{title}: {домен}»)
+        from app.config import get_settings
+        assert chat.call_args.kwargs["title"] == get_settings().placement_title
+        assert chat.call_args.kwargs["title"].endswith(": shared.ru") is False
+
+    def test_shared_mode_reuses_existing_shared_chat(self, client):
+        """Второй портал с chat_mode='shared' переиспользует уже созданный общий чат — нового чата не создаёт."""
+        with (
+            patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
+            patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=777) as chat,
+            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+        ):
+            # Сначала создаём первый общий чат через API
+            first = client.post(
+                "/api/portals",
+                json={
+                    "domain": "one.ru",
+                    "auth_type": "webhook",
+                    "credentials": "https://one.ru/rest/1/a/",
+                    "chat_mode": "shared",
+                },
+            ).json()
+            _wait_for_status(client, first["id"])
+
+            # Первый портал создал общий чат и сохранил его в shared_chats.
+            # Второй портал должен переиспользовать его без создания нового чата.
+            chat.reset_mock()
+            second = client.post(
+                "/api/portals",
+                json={
+                    "domain": "two.ru",
+                    "auth_type": "webhook",
+                    "credentials": "https://two.ru/rest/1/b/",
+                    "chat_mode": "shared",
+                },
+            ).json()
+            data = _wait_for_status(client, second["id"])
+
+        assert data["status"] == "active"
+        assert data["main_chat_id"] == 777  # тот же общий чат
+        # Второй портал НЕ создаёт новый чат — переиспользует существующий
+        assert chat.call_count == 0
 
     def test_invalid_credentials_ends_in_error_status(self, client):
         from app.external_portal_client import ExternalPortalCredentialsError

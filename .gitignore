@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.venv-test/
 
 # БД (Этап 2)
 db/*.db

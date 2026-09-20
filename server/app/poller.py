@@ -100,36 +100,65 @@ async def finish_connecting_portal(portal: repo.ExternalPortal) -> None:
         return
 
     settings = get_settings()
-    chat_title = f"{settings.placement_title}: {portal.domain}"
-    try:
-        chat_id = await create_group_chat(title=chat_title, user_ids=[portal.owner_user_id])
-    except VibeApiError as exc:
-        logger.error(
-            "Портал #%s (%s): не удалось создать чат на основном портале: %s",
-            portal.id, portal.domain, exc.payload,
-        )
-        await repo.mark_portal_error(portal.id, f"Не удалось создать чат на основном портале: {exc.payload}")
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Портал #%s (%s): неожиданная ошибка при создании чата", portal.id, portal.domain)
-        await repo.mark_portal_error(portal.id, f"Ошибка при создании чата: {type(exc).__name__}: {exc}")
-        return
+    if portal.chat_mode == "shared":
+        # Общий чат «Сборщик сообщений» (один на сотрудника) — переиспользуем,
+        # если уже создан ранее, иначе создаём сейчас для этого портала.
+        shared_chat_id = await repo.get_shared_chat(portal.owner_user_id)
+        if shared_chat_id is not None:
+            chat_id = shared_chat_id
+            should_greet = False
+        else:
+            chat_title = settings.placement_title
+            try:
+                chat_id = await create_group_chat(title=chat_title, user_ids=[portal.owner_user_id])
+            except VibeApiError as exc:
+                logger.error(
+                    "Портал #%s (%s): не удалось создать общий чат «%s»: %s",
+                    portal.id, portal.domain, chat_title, exc.payload,
+                )
+                await repo.mark_portal_error(portal.id, f"Не удалось создать общий чат «{chat_title}»: {exc.payload}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Портал #%s (%s): неожиданная ошибка при создании общего чата", portal.id, portal.domain)
+                await repo.mark_portal_error(portal.id, f"Ошибка при создании общего чата: {type(exc).__name__}: {exc}")
+                return
+            await repo.create_shared_chat(portal.owner_user_id, chat_id, chat_title)
+            should_greet = True
+    else:
+        # Отдельный чат «Сборщик сообщений: {Название портала}» (как раньше).
+        chat_title = f"{settings.placement_title}: {portal.domain}"
+        try:
+            chat_id = await create_group_chat(title=chat_title, user_ids=[portal.owner_user_id])
+        except VibeApiError as exc:
+            logger.error(
+                "Портал #%s (%s): не удалось создать чат на основном портале: %s",
+                portal.id, portal.domain, exc.payload,
+            )
+            await repo.mark_portal_error(portal.id, f"Не удалось создать чат на основном портале: {exc.payload}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Портал #%s (%s): неожиданная ошибка при создании чата", portal.id, portal.domain)
+            await repo.mark_portal_error(portal.id, f"Ошибка при создании чата: {type(exc).__name__}: {exc}")
+            return
+        should_greet = True
 
     await repo.mark_portal_active(portal.id, chat_id)
+    await repo.set_chat_mode(portal.id, portal.chat_mode)
     logger.info("Портал #%s (%s): подключение завершено, чат %s", portal.id, portal.domain, chat_id)
 
-    # Приветственное сообщение — не критично для успеха подключения,
-    # поэтому ошибку отправки только логируем, портал остаётся active.
-    try:
-        await send_chat_message(
-            chat_id,
-            f"Портал «{portal.domain}» подключён. Сюда будут приходить сообщения сотруднику с этого портала.",
-        )
-    except VibeApiError as exc:
-        logger.warning(
-            "Портал #%s (%s): не удалось отправить приветственное сообщение в чат %s: %s",
-            portal.id, portal.domain, chat_id, exc.payload,
-        )
+    if should_greet:
+        # Приветственное сообщение — не критично для успеха подключения,
+        # поэтому ошибку отправки только логируем, портал остаётся active.
+        try:
+            await send_chat_message(
+                chat_id,
+                f"Портал «{portal.domain}» подключён. Сюда будут приходить сообщения сотруднику с этого портала.",
+            )
+        except VibeApiError as exc:
+            logger.warning(
+                "Портал #%s (%s): не удалось отправить приветственное сообщение в чат %s: %s",
+                portal.id, portal.domain, chat_id, exc.payload,
+            )
 
 
 async def _process_portal(portal: repo.ExternalPortal) -> None:
@@ -179,9 +208,14 @@ def _format_time(iso_date: str) -> str:
 
 def _format_digest(portal: repo.ExternalPortal, dialog_messages: list[FetchedMessage]) -> str:
     """
-    Формат: автор, время, текст по каждому сообщению + ссылка на диалог
-    (PLAN.md, Этап 5). Несколько сообщений одного диалога за цикл опроса
-    объединяются в один дайджест.
+    Формирует человеко-понятный дайджест по одному чату (диалогу) за цикл
+    опроса. Несколько сообщений одного чата объединяются в один дайджест.
+
+    В дайджесте явно указаны (в человеко-понятном виде, без сырых id):
+    - портал, с которого пришли сообщения (portal.domain);
+    - название чата (dialog_title);
+    - отправитель, время и текст по каждому сообщению;
+    - ссылка на диалог во внешнем портале.
 
     Ссылка на диалог собрана по распространённому в сообществе паттерну
     Битрикс24 `/online/?IM_DIALOG={dialog_id}` — этот формат НЕ значится в
@@ -193,9 +227,9 @@ def _format_digest(portal: repo.ExternalPortal, dialog_messages: list[FetchedMes
     title = dialog_messages[0].dialog_title
     kind = "открытая линия" if dialog_messages[0].is_open_line else "чат"
 
-    lines = [f"💬 {title} ({kind}, портал {portal.domain})", ""]
+    lines = [f"📬 Портал: {portal.domain}", f"💬 Чат: {title} ({kind})", ""]
     for m in dialog_messages:
-        lines.append(f"{m.author_name}, {_format_time(m.date)}:")
+        lines.append(f"👤 {m.author_name}, {_format_time(m.date)}:")
         lines.append(m.text)
         lines.append("")
 

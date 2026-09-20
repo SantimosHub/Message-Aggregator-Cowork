@@ -38,6 +38,9 @@ class ConnectPortalRequest(BaseModel):
     # про то, почему vibe_api как вариант авторизации внешнего портала убран).
     auth_type: Literal["webhook"] = "webhook"
     credentials: str = Field(..., min_length=1, description="URL вебхука")
+    # Куда пересылать сообщения этого портала: 'shared' — в общий чат
+    # «Сборщик сообщений», 'separate' — в отдельный чат «Сборщик сообщений: {домен}».
+    chat_mode: Literal["shared", "separate"] = "separate"
 
 
 class PortalResponse(BaseModel):
@@ -45,6 +48,7 @@ class PortalResponse(BaseModel):
     domain: str
     auth_type: str
     main_chat_id: Optional[int]
+    chat_mode: str
     status: str
     error_message: Optional[str]
     created_at: str
@@ -57,6 +61,7 @@ class PortalResponse(BaseModel):
             domain=portal.domain,
             auth_type=portal.auth_type,
             main_chat_id=portal.main_chat_id,
+            chat_mode=portal.chat_mode,
             status=portal.status,
             error_message=portal.error_message,
             created_at=portal.created_at,
@@ -86,6 +91,7 @@ async def connect_portal(
             domain=body.domain,
             auth_type=body.auth_type,
             credentials=body.credentials,
+            chat_mode=body.chat_mode,
         )
     except HTTPException:
         raise

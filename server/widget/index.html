@@ -374,6 +374,15 @@
     </div>
 
     <div class="field">
+      <label>Куда пересылать сообщения</label>
+      <div class="segmented" id="chat-mode-selector">
+        <button type="button" class="active" data-chat-mode="shared">Общий чат</button>
+        <button type="button" data-chat-mode="separate">Отдельный чат</button>
+      </div>
+      <div class="hint" id="chat-mode-hint">Общий чат — «Сборщик сообщений» (один на все порталы). Отдельный чат — «Сборщик сообщений: {Название портала}».</div>
+    </div>
+
+    <div class="field">
       <label for="credentials-input" id="credentials-label">URL вебхука</label>
       <input type="text" id="credentials-input" name="credentials" placeholder="https://портал.bitrix24.ru/rest/1/токен/" autocomplete="off" />
       <div class="hint" id="credentials-hint">
@@ -447,6 +456,19 @@
   var elFormError = document.getElementById("form-error");
   var elDomainInput = document.getElementById("domain-input");
   var elCredentialsInput = document.getElementById("credentials-input");
+  var elChatModeSelector = document.getElementById("chat-mode-selector");
+  var selectedChatMode = "shared"; // по умолчанию — общий чат «Сборщик сообщений»
+
+  // Выбор «куда пересылать»: общий чат или отдельный.
+  elChatModeSelector.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-chat-mode]");
+    if (!btn) return;
+    elChatModeSelector.querySelectorAll("[data-chat-mode]").forEach(function (b) {
+      b.classList.remove("active");
+    });
+    btn.classList.add("active");
+    selectedChatMode = btn.getAttribute("data-chat-mode");
+  });
 
   // ---------- Открытие/закрытие формы ----------
   function openForm() {
@@ -497,7 +519,7 @@
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domain: domain, auth_type: "webhook", credentials: credentials })
+      body: JSON.stringify({ domain: domain, auth_type: "webhook", credentials: credentials, chat_mode: selectedChatMode })
     })
       .then(function (resp) {
         if (!resp.ok) {
@@ -563,6 +585,7 @@
     disabled: { text: "Отключено", hint: null }
   };
   var AUTH_TYPE_LABEL = { vibe_api: "Ключ Вайбкод", webhook: "Вебхук" };
+  var CHAT_MODE_LABEL = { shared: "Общий чат", separate: "Отдельный чат" };
 
   function escapeHtml(str) {
     var div = document.createElement("div");
@@ -598,6 +621,7 @@
         '<div class="card-domain">' + escapeHtml(p.domain) + '</div>' +
         '<div class="card-meta">' +
         '<span class="chip">' + (AUTH_TYPE_LABEL[p.auth_type] || p.auth_type) + '</span>' +
+        '<span class="chip">' + (CHAT_MODE_LABEL[p.chat_mode] || p.chat_mode) + '</span>' +
         '<span class="status-text ' + p.status + '">' + statusCopy.text + '</span>' +
         '</div>' +
         (hint ? '<div class="card-error-hint">' + hint + '</div>' : '') +

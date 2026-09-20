@@ -32,7 +32,10 @@ from app.main import app  # noqa: E402
 
 def _reset_db() -> None:
     if _db.exists():
-        _db.unlink()
+        try:
+            _db.unlink()
+        except PermissionError:
+            pass
     asyncio.run(init_db())
 
 
@@ -41,7 +44,13 @@ def fresh_db():
     _reset_db()
     yield
     if _db.exists():
-        _db.unlink()
+        # На Windows файл может быть кратко залочен (открытые соединения
+        # aiosqlite/поллер) — не валим тест из-за невозможности удалить
+        # временную БД в teardown.
+        try:
+            _db.unlink(missing_ok=True)
+        except PermissionError:
+            pass
 
 
 @pytest.fixture
@@ -89,6 +98,16 @@ class TestWidgetIndex:
         html = client.get("/").text
         assert "data-auth-type" not in html
         assert "URL вебхука" in html
+
+    def test_widget_offers_chat_mode_choice(self, client):
+        """При подключении портала виджет даёт выбрать: общий чат или отдельный
+        (см. новый флоу Этапа: общий чат «Сборщик сообщений» или отдельный «Сборщик
+        сообщений: {Название портала}»)."""
+        html = client.get("/").text
+        assert 'data-chat-mode="shared"' in html
+        assert 'data-chat-mode="separate"' in html
+        assert "Общий чат" in html
+        assert "Отдельный чат" in html
 
     def test_widget_handles_all_status_values(self, client):
         """PortalStatus = Literal["connecting", "active", "error", "disabled"] — все должны быть отрисовываемы."""
