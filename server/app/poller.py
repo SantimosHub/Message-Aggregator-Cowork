@@ -33,11 +33,37 @@ from .config import get_settings
 from .external_message_fetcher import ExternalPortalApiError, FetchedMessage, fetch_new_messages
 from .external_portal_client import ExternalPortalCredentialsError, validate_webhook
 from .repositories import external_portals as repo
-from .vibe_client import VibeApiError, create_group_chat, send_chat_message
+from .vibe_client import VibeApiError, create_group_chat, delete_group_chat, send_chat_message
 
 logger = logging.getLogger("message_aggregator.poller")
 
 POLL_INTERVAL_SECONDS = 45  # середина диапазона 30-60 сек из PLAN.md
+
+def _cleanup_error_reason(exc: BaseException) -> str:
+    """Краткая человеко-читаемая причина сбоя удаления чата — чтобы в
+    уведомлении/в UI было видно, ПОЧЕМУ чат не удалился (код и текст отказа
+    Бот-платформы), а не просто «не удалось». VibeApiError несёт статус и
+    payload; таймаут/сеть даёт тип и текст."""
+    if isinstance(exc, VibeApiError):
+        code = None
+        message = None
+        payload = exc.payload if isinstance(exc.payload, dict) else {}
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+        if code is None:
+            code = payload.get("code")
+        if message is None:
+            message = payload.get("message")
+        bits = [f"статус {exc.status_code}"]
+        if code:
+            bits.append(f"код {code}")
+        if message:
+            bits.append(str(message)[:200])
+        return ", ".join(bits)
+    return f"{type(exc).__name__}: {exc}"
+
 
 # asyncio.create_task() хранит только СЛАБУЮ ссылку на задачу на уровне event
 # loop — без сильной ссылки где-то ещё сборщик мусора может оборвать задачу
@@ -106,7 +132,11 @@ async def finish_connecting_portal(portal: repo.ExternalPortal) -> None:
         shared_chat_id = await repo.get_shared_chat(portal.owner_user_id)
         if shared_chat_id is not None:
             chat_id = shared_chat_id
-            should_greet = False
+            # Приветствие о подключении отправляем при КАЖДОМ подключении
+            # портала в общий чат (а не только когда чат создан впервые):
+            # пользователь должен видеть, что и последующие порталы подключены
+            # и их сообщения будут приходить сюда же.
+            should_greet = True
         else:
             chat_title = settings.placement_title
             try:
@@ -159,6 +189,171 @@ async def finish_connecting_portal(portal: repo.ExternalPortal) -> None:
                 "Портал #%s (%s): не удалось отправить приветственное сообщение в чат %s: %s",
                 portal.id, portal.domain, chat_id, exc.payload,
             )
+
+
+async def finish_disconnect_chats(
+    *,
+    owner_user_id: int,
+    separate_chat_id: int | None,
+    shared_chat_id: int | None,
+) -> None:
+    """
+    Удаляет чаты на основном портале при отключении внешнего портала.
+
+    Это СЕТЕВЫЕ вызовы к Бот-платформе — поэтому выполняются как отдельная
+    asyncio-задача ВНЕ обработчика DELETE (см. routes/portals.py и баг
+    Gateway-туннеля: исходящий вызов внутри туннелированного запроса рвёт
+    соединение — та же причина, по которой создание чата вынесено в
+    finish_connecting_portal).
+
+    - owner_user_id — сотрудник, которому принадлежал отключаемый портал;
+      его уведомления об ошибках очистки пишем в cleanup_notices.
+    - separate_chat_id — id отдельного чата «Сборщик сообщений: {портал}»,
+      который удаляем, если портал был в режиме 'separate'.
+    - shared_chat_id — id общего чата «Сборщик сообщений», который удаляем,
+      если отключаемый портал был последним у сотрудника.
+
+    Запись портала в БД уже удалена на момент вызова (это делает routes).
+    """
+    if separate_chat_id is not None:
+        try:
+            await delete_group_chat(separate_chat_id)
+            logger.info("Отключение портала: удалён отдельный чат %s", separate_chat_id)
+        except VibeApiError as exc:
+            logger.warning("Не удалось удалить отдельный чат %s: %s", separate_chat_id, exc.payload)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Не удалось удалить отдельный чат при отключении портала. "
+                f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Неожиданная ошибка при удалении отдельного чата %s", separate_chat_id)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Не удалось удалить отдельный чат при отключении портала. "
+                f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+
+    if shared_chat_id is not None:
+        try:
+            await delete_group_chat(shared_chat_id)
+            logger.info("Удалён общий чат «Сборщик сообщений» %s (порталов не осталось)", shared_chat_id)
+        except VibeApiError as exc:
+            logger.warning("Не удалось удалить общий чат %s: %s", shared_chat_id, exc.payload)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Не удалось удалить общий чат «Сборщик сообщений». "
+                f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Неожиданная ошибка при удалении общего чата %s", shared_chat_id)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Не удалось удалить общий чат «Сборщик сообщений». "
+                f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+
+
+def schedule_finish_disconnect(
+    *,
+    owner_user_id: int,
+    separate_chat_id: int | None,
+    shared_chat_id: int | None,
+) -> asyncio.Task:
+    """
+    Запускает finish_disconnect_chats как отвязанную от запроса задачу
+    (та же причина, что schedule_finish_connecting) и удерживает сильную
+    ссылку, пока она не завершится.
+    """
+    task = asyncio.create_task(
+        finish_disconnect_chats(
+            owner_user_id=owner_user_id,
+            separate_chat_id=separate_chat_id,
+            shared_chat_id=shared_chat_id,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def finish_reset_chats(
+    *,
+    owner_user_id: int,
+    separate_chat_ids: list[int],
+    shared_chat_id: int | None,
+) -> None:
+    """
+    Удаляет ВСЕ чаты приложения на основном портале при сбросе настроек.
+
+    Это СЕТЕВЫЕ вызовы к Бот-платформе — выполняются как отдельная
+    asyncio-задача ВНЕ обработчика (та же причина, что finish_disconnect_chats).
+
+    - owner_user_id — сотрудник, выполняющий сброс; его уведомления об
+      ошибках очистки пишем в cleanup_notices.
+    - separate_chat_ids — id отдельных чатов «Сборщик сообщений: {портал}»
+      всех отключаемых порталов в режиме 'separate'.
+    - shared_chat_id — id общего чата «Сборщик сообщений», если он есть.
+
+    Записи порталов и общего чата в БД уже удалены на момент вызова
+    (это делает routes).
+    """
+    for chat_id in separate_chat_ids:
+        try:
+            await delete_group_chat(chat_id)
+            logger.info("Сброс: удалён отдельный чат %s", chat_id)
+        except VibeApiError as exc:
+            logger.warning("Сброс: не удалось удалить отдельный чат %s: %s", chat_id, exc.payload)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Сброс: не удалось удалить некоторые отдельные чаты. "
+                f"Они могут остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Сброс: неожиданная ошибка при удалении отдельного чата %s", chat_id)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Сброс: не удалось удалить некоторые отдельные чаты. "
+                f"Они могут остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+
+    if shared_chat_id is not None:
+        try:
+            await delete_group_chat(shared_chat_id)
+            logger.info("Сброс: удалён общий чат «Сборщик сообщений» %s", shared_chat_id)
+        except VibeApiError as exc:
+            logger.warning("Сброс: не удалось удалить общий чат %s: %s", shared_chat_id, exc.payload)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Сброс: не удалось удалить общий чат «Сборщик сообщений». "
+                f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Сброс: неожиданная ошибка при удалении общего чата %s", shared_chat_id)
+            await repo.add_cleanup_notice(
+                owner_user_id,
+                "Сброс: не удалось удалить общий чат «Сборщик сообщений». "
+                f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
+            )
+
+
+def schedule_finish_reset(
+    *,
+    owner_user_id: int,
+    separate_chat_ids: list[int],
+    shared_chat_id: int | None,
+) -> asyncio.Task:
+    """Запускает finish_reset_chats как отвязанную от запроса задачу."""
+    task = asyncio.create_task(
+        finish_reset_chats(
+            owner_user_id=owner_user_id,
+            separate_chat_ids=separate_chat_ids,
+            shared_chat_id=shared_chat_id,
+        )
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 async def _process_portal(portal: repo.ExternalPortal) -> None:
@@ -233,7 +428,11 @@ def _format_digest(portal: repo.ExternalPortal, dialog_messages: list[FetchedMes
         lines.append(m.text)
         lines.append("")
 
-    link = f"https://{portal.domain}/online/?IM_DIALOG={dialog_messages[0].dialog_id}"
+    # Ссылку строим от РЕАЛЬНОГО домена внешнего портала (portal_domain,
+    # host из URL вебхука), а не от человекочитаемого названия `portal.domain`:
+    # пользователь может задать порталу любое название, не совпадающее с доменом.
+    # Фолбэк на domain — для старых записей, где portal_domain ещё не заполнен.
+    link = f"https://{(portal.portal_domain or portal.domain)}/online/?IM_DIALOG={dialog_messages[0].dialog_id}"
     # [URL=...] вместо голой ссылки — Битрикс24 автоматически разворачивает
     # "голые" URL на своих доменах в большую карточку-превью с логотипом и
     # кнопкой "Войти в Битрикс24" на каждое сообщение, что визуально

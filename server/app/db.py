@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS external_portals (
     -- никогда не будет писаться новым кодом. Не стоит того риска.
     auth_type            TEXT NOT NULL CHECK (auth_type IN ('vibe_api', 'webhook')),
     credentials          TEXT NOT NULL,
+    -- Реальный домен внешнего портала (host из URL вебхука), не путать с
+    -- `domain` — человекочитаемым названием портала, которое пользователь
+    -- задаёт при подключении. Используется для сборки ссылок «Открыть диалог»
+    -- в пересылаемых дайджестах (см. poller._format_digest). NULL — если не
+    -- удалось извлечь (URL непохож на вебхук / старые записи).
+    portal_domain        TEXT,
     main_chat_id         INTEGER,
     last_message_cursor  TEXT NOT NULL DEFAULT '{}',
     status               TEXT NOT NULL DEFAULT 'connecting' CHECK (status IN ('connecting', 'active', 'error', 'disabled')),
@@ -56,6 +62,19 @@ CREATE TABLE IF NOT EXISTS shared_chats (
     title        TEXT NOT NULL,
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Явные уведомления для сотрудника (например, об ошибке очистки чатов при
+-- отключении портала / сбросе настроек). Виджет читает их и показывает
+-- пользователю, затем (или по закрытию) удаляет.
+CREATE TABLE IF NOT EXISTS cleanup_notices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_user_id INTEGER NOT NULL,
+    message      TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_cleanup_notices_owner
+    ON cleanup_notices (owner_user_id);
 """
 
 
@@ -187,6 +206,20 @@ async def _migrate_chat_mode_column(conn: aiosqlite.Connection) -> None:
         await conn.commit()
 
 
+async def _migrate_portal_domain_column(conn: aiosqlite.Connection) -> None:
+    """
+    Добавляет колонку portal_domain, если её ещё нет (для БД, созданных до
+    того, как ссылку «Открыть диалог» стали строить от реального домена
+    внешнего портала, а не от его человекочитаемого названия). Старые записи
+    получат NULL — при формировании ссылки код сделает фолбэк на domain.
+    """
+    async with conn.execute("PRAGMA table_info(external_portals)") as cur:
+        columns = {row[1] async for row in cur}
+    if "portal_domain" not in columns:
+        await conn.execute("ALTER TABLE external_portals ADD COLUMN portal_domain TEXT")
+        await conn.commit()
+
+
 async def init_db() -> None:
     """Создаёт таблицы, если их ещё нет. Вызывать один раз при старте приложения."""
     async with get_connection() as conn:
@@ -196,3 +229,4 @@ async def init_db() -> None:
         await _migrate_error_message_column(conn)
         await _migrate_owner_external_user_id_column(conn)
         await _migrate_chat_mode_column(conn)
+        await _migrate_portal_domain_column(conn)

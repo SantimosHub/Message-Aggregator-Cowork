@@ -109,6 +109,24 @@ class TestWidgetIndex:
         assert "Общий чат" in html
         assert "Отдельный чат" in html
 
+    def test_widget_has_reset_settings_button(self, client):
+        """Виджет содержит кнопку «Сброс настроек» и роут сброса."""
+        html = client.get("/").text
+        assert "Сброс настроек" in html
+        assert 'id="reset-settings-btn"' in html
+        assert "reset" in html
+
+    def test_widget_shows_current_app_version(self, client):
+        """Версия в отданном HTML берётся из server/version.txt (подстановка
+        вместо плейсхолдера __APP_VERSION__), а не хардкодится в виджете —
+        иначе после инкремента 0.01 перед каждым деплоем она не обновлялась бы."""
+        from app.main import APP_VERSION_PATH
+
+        version = APP_VERSION_PATH.read_text(encoding="utf-8").strip()
+        html = client.get("/").text
+        assert f"V {version}" in html
+        assert "__APP_VERSION__" not in html
+
     def test_widget_handles_all_status_values(self, client):
         """PortalStatus = Literal["connecting", "active", "error", "disabled"] — все должны быть отрисовываемы."""
         html = client.get("/").text

@@ -23,6 +23,7 @@ def _portal(**overrides) -> ExternalPortal:
         domain="ext.example.ru",
         auth_type="webhook",
         credentials="https://ext.example.ru/rest/1/token/",
+        portal_domain="ext.example.ru",
         main_chat_id=42,
         last_message_cursor={},
         status="active",

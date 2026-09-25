@@ -47,8 +47,21 @@ class VibeApiError(RuntimeError):
         super().__init__(f"Vibe API error {status_code}: {payload}")
 
 
-async def _request(method: str, path: str, *, headers: dict, json: dict | None = None) -> dict:
-    """Общий helper: выполняет запрос, парсит ответ, кидает VibeApiError при неуспехе."""
+async def _request(
+    method: str,
+    path: str,
+    *,
+    headers: dict,
+    json: dict | None = None,
+    timeout: float = 15,
+) -> dict:
+    """Общий helper: выполняет запрос, парсит ответ, кидает VibeApiError при неуспехе.
+
+    timeout — таймаут HTTP-вызова в секундах. По умолчанию 15, но медленные
+    операции (например, удаление чата) могут требовать заметно большего:
+    Бот-платформа/портал временами отвечает десятками секунд, и обрыв по
+    таймауту превращается в ложное «не удалось удалить чат» (см.
+    delete_group_chat и poller.finish_disconnect_chats)."""
     settings = get_settings()
     async with httpx.AsyncClient(base_url=settings.vibe_api_base_url, timeout=15) as client:
         resp = await client.request(method, path, headers=headers, json=json)
@@ -149,6 +162,59 @@ async def send_chat_message(chat_id: int, text: str) -> int:
         json={"dialogId": dialog_id, "fields": {"message": text}},
     )
     return data["data"]["id"]
+
+
+async def delete_group_chat(chat_id: int) -> None:
+    """
+    Закрывает групповой чат на основном портале от имени бота.
+
+    Прямого метода «удалить чат» на Бот-платформе НЕТ (ранее мы звали
+    несуществующий POST .../chats/{dialogId}/delete — платформа отвечала
+    404 ROUTE_NOT_FOUND, поэтому чаты никогда не удалялись). По документации
+    imbot.v2 чат автоматически исчезает из списка диалогов, когда в нём не
+    остаётся ни одного участника. Поэтому:
+      1. GET .../chats/{dialogId}/users  — список участников (Chat.User.list);
+      2. DELETE .../chats/{dialogId}/users (по одному userId) — удаляем всех
+         участников-людей (Chat.User.delete; бота не удаляем);
+      3. POST .../chats/{dialogId}/leave — бот покидает чат (Chat.leave),
+         после чего в чате не остаётся никого и он исчезает.
+
+    Используется при отключении внешнего портала с отдельным чатом, а также
+    при удалении последнего портала — тогда же закрывается общий чат
+    (см. routes/portals.py, disconnect_portal). Ошибки доходят как VibeApiError.
+    """
+    settings = get_settings()
+    bot_id = await _ensure_bot_id()
+    dialog_id = f"chat{chat_id}"
+    headers = {"X-Api-Key": settings.vibe_background_api_key}
+
+    members = await _request(
+        "GET",
+        f"/v1/bots/{bot_id}/chats/{dialog_id}/users",
+        headers=headers,
+        # Управление чатом на живом портале может идти заметно дольше 15 секунд
+        # (таймаут по умолчанию): обрыв трактуется как «чай не удалось удалить»
+        # и порождает ложное уведомление. Даём операциям запас.
+        timeout=60,
+    )
+    for member in members["data"]:
+        # Не трогаем самого бота — его убираем из чата через leave в конце.
+        if member.get("id") == bot_id or member.get("bot"):
+            continue
+        await _request(
+            "DELETE",
+            f"/v1/bots/{bot_id}/chats/{dialog_id}/users",
+            headers=headers,
+            json={"userId": member["id"]},
+            timeout=60,
+        )
+
+    await _request(
+        "POST",
+        f"/v1/bots/{bot_id}/chats/{dialog_id}/leave",
+        headers=headers,
+        timeout=60,
+    )
 
 
 async def get_me(session_bearer: str | None = None) -> dict:

@@ -164,7 +164,7 @@ class TestConnectPortalWebhook:
         with (
             patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
             patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=777) as chat,
-            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+            patch("app.poller.send_chat_message", new_callable=AsyncMock) as send,
         ):
             resp = client.post(
                 "/api/portals",
@@ -193,7 +193,7 @@ class TestConnectPortalWebhook:
         with (
             patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
             patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=777) as chat,
-            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+            patch("app.poller.send_chat_message", new_callable=AsyncMock) as send,
         ):
             # Сначала создаём первый общий чат через API
             first = client.post(
@@ -225,6 +225,53 @@ class TestConnectPortalWebhook:
         assert data["main_chat_id"] == 777  # тот же общий чат
         # Второй портал НЕ создаёт новый чат — переиспользует существующий
         assert chat.call_count == 0
+        # Но приветствие о подключении отправляется и для повторного портала
+        # в общий чат (не только при создании общего чата первым порталом).
+        assert send.called
+        texts = [c.args[1] for c in send.call_args_list]
+        assert any("two.ru" in t for t in texts)
+
+    def test_delete_last_shared_portal_removes_shared_chat(self, client):
+        """
+        Отключение ПОСЛЕДНЕГО портала (единственного, в общем чате):
+        запись портала удаляется, на основном портале удаляется общий чат
+        «Сборщик сообщений», и запись общего чата из shared_chats пропадает.
+        """
+        from app.repositories import external_portals as repo
+
+        with (
+            patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
+            patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=777),
+            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+            patch("app.routes.portals.schedule_finish_disconnect") as sched,
+        ):
+            created = client.post(
+                "/api/portals",
+                json={
+                    "domain": "only.ru",
+                    "auth_type": "webhook",
+                    "credentials": "https://only.ru/rest/1/x/",
+                    "chat_mode": "shared",
+                },
+            ).json()
+            data = _wait_for_status(client, created["id"])
+            shared_chat_id = data["main_chat_id"]
+
+            # Общий чат создан и сохранён
+            assert asyncio.run(repo.get_shared_chat(OWNER_ID)) is not None
+
+            resp = client.delete(f"/api/portals/{created['id']}")
+
+        assert resp.status_code == 204
+        assert client.get("/api/portals").json() == []
+        # Запланировано удаление общего чата на основном портале (отдельного
+        # у shared-портала нет), а запись общего чата из БД убрана.
+        sched.assert_called_once_with(
+            owner_user_id=OWNER_ID,
+            separate_chat_id=None,
+            shared_chat_id=shared_chat_id,
+        )
+        assert asyncio.run(repo.get_shared_chat(OWNER_ID)) is None
 
     def test_invalid_credentials_ends_in_error_status(self, client):
         from app.external_portal_client import ExternalPortalCredentialsError
@@ -292,6 +339,7 @@ class TestListAndDelete:
             patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
             patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=1),
             patch("app.poller.send_chat_message", new_callable=AsyncMock),
+            patch("app.routes.portals.schedule_finish_disconnect") as sched,
         ):
             created = client.post(
                 "/api/portals",
@@ -299,11 +347,17 @@ class TestListAndDelete:
             ).json()
             _wait_for_status(client, created["id"])
 
-        assert len(client.get("/api/portals").json()) == 1
+            assert len(client.get("/api/portals").json()) == 1
 
-        portal_id = client.get("/api/portals").json()[0]["id"]
-        assert client.delete(f"/api/portals/{portal_id}").status_code == 204
-        assert client.get("/api/portals").json() == []
+            portal_id = client.get("/api/portals").json()[0]["id"]
+            assert client.delete(f"/api/portals/{portal_id}").status_code == 204
+            assert client.get("/api/portals").json() == []
+            # Отдельный чат отдельного портала удалён на основном портале
+            sched.assert_called_once_with(
+                owner_user_id=OWNER_ID,
+                separate_chat_id=1,
+                shared_chat_id=None,
+            )
 
     def test_delete_foreign_portal_returns_404(self, client):
         with (
@@ -320,6 +374,177 @@ class TestListAndDelete:
         app.dependency_overrides[get_current_owner_user_id] = lambda: 99999
         assert client.delete(f"/api/portals/{created['id']}").status_code == 404
         app.dependency_overrides[get_current_owner_user_id] = lambda: OWNER_ID
+
+    def test_undecryptable_portal_does_not_break_list_and_can_be_deleted(self, client):
+        """
+        Устойчивое чтение: если одна запись не расшифровывается текущим ключом
+        (например, зашифрована старым ключом/алгоритмом), список порталов НЕ
+        должен падать в 500 — запись остаётся видимой и её можно удалить.
+        """
+        import os
+        import base64
+        from app.db import get_connection
+
+        # Создаём нормальный портал (зашифрован рабочим ключом).
+        with (
+            patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
+            patch("app.poller.create_group_chat", new_callable=AsyncMock, return_value=5),
+            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+        ):
+            created = client.post(
+                "/api/portals",
+                json={"domain": "broken.ru", "auth_type": "webhook", "credentials": "https://broken.ru/rest/1/x/"},
+            ).json()
+            _wait_for_status(client, created["id"])
+
+        # Портим запись: кладём в credentials мусор, который не является валидным
+        # шифротекстом — decrypt_credentials обязан бросить CredentialsCryptoError.
+        bogus = base64.b64encode(os.urandom(8)).decode("ascii")  # заведомо не блоб
+
+        async def _poke():
+            async with get_connection() as conn:
+                await conn.execute(
+                    "UPDATE external_portals SET credentials = ? WHERE id = ?",
+                    (bogus, created["id"]),
+                )
+                await conn.commit()
+        asyncio.run(_poke())
+
+        # Список грузится (200), битая запись остаётся видимой, без 500.
+        resp = client.get("/api/portals")
+        assert resp.status_code == 200, resp.text
+        items = resp.json()
+        assert len(items) == 1
+        assert items[0]["id"] == created["id"]
+        assert items[0]["status"] in ("active", "error")
+        # "Секрет" битой записи наружу не уходит (ответ собирается без credentials).
+        assert "credentials" not in items[0]
+
+        # Битую запись можно удалить через API (расшифровка не требуется).
+        assert client.delete(f"/api/portals/{created['id']}").status_code == 204
+        assert client.get("/api/portals").json() == []
+
+    def test_unreadable_credentials_do_not_break_list(self, client):
+        """
+        Запись портала с credentials, которые текущий ключ расшифровать не может
+        (повреждённый/старый шифротекст), НЕ роняет GET /api/portals: список
+        возвращается, а такая запись видна (credentials как заглушка) и
+        может быть удалена через DELETE — не затрагивая чужие данные.
+        """
+
+        # Прямо вставляем портал с заведомо нерасшифровываемым шифротекстом
+        # (валидный keyworking, но мусор вместо настоящего блоба).
+        async def insert_broken():
+            from app.db import get_connection
+            async with get_connection() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO external_portals
+                        (owner_user_id, domain, auth_type, credentials, last_message_cursor, status, chat_mode)
+                    VALUES (?, ?, 'webhook', ?, '{}', 'error', 'separate')
+                    """,
+                    (OWNER_ID, "broken.ru", "definitely-not-a-valid-encrypted-blob"),
+                )
+                await conn.commit()
+
+        asyncio.run(insert_broken())
+
+        # Список не падает: возвращается 200 и обе записи видны (нерасшифруемая — со заглушкой).
+        resp = client.get("/api/portals")
+        assert resp.status_code == 200, resp.text
+        portals = resp.json()
+        broken = [p for p in portals if p["domain"] == "broken.ru"]
+        assert len(broken) == 1
+        # credentials в ответе нет вовсе (секрет никогда не возвращается) — проверяем,
+        # что запись присутствует и не уронила список.
+        assert "credentials" not in broken[0]
+
+
+class TestResetSettings:
+    def test_reset_removes_all_portals_and_schedules_chat_deletion(self, client):
+        """
+        Сброс настроек: отключает ВСЕ порталы сотрудника (независимо от статуса),
+        удаляет его записи + запись общего чата, и планирует удаление всех чатов
+        (отдельных и общего) фоновой задачей.
+        """
+        from app.repositories import external_portals as repo
+
+        with (
+            patch("app.poller.validate_webhook", new_callable=AsyncMock, return_value={"result": {"ID": "1"}}),
+            # Первый портал (separate) создаёт чат 100, второй (shared) — чат 200
+            patch("app.poller.create_group_chat", new_callable=AsyncMock, side_effect=[100, 200]),
+            patch("app.poller.send_chat_message", new_callable=AsyncMock),
+            patch("app.routes.portals.schedule_finish_reset") as sched_reset,
+        ):
+            # Отдельный портал (чат 100) + общий портал (чат 200)
+            sep = client.post(
+                "/api/portals",
+                json={"domain": "sep.ru", "auth_type": "webhook", "credentials": "https://sep.ru/rest/1/a/", "chat_mode": "separate"},
+            ).json()
+            _wait_for_status(client, sep["id"])
+
+            shared = client.post(
+                "/api/portals",
+                json={"domain": "shared.ru", "auth_type": "webhook", "credentials": "https://shared.ru/rest/1/b/", "chat_mode": "shared"},
+            ).json()
+            _wait_for_status(client, shared["id"])
+
+            assert len(client.get("/api/portals").json()) == 2
+
+            resp = client.post("/api/portals/reset")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "reset"
+        assert client.get("/api/portals").json() == []
+        # Общая запись и запись общего чата убраны
+        assert asyncio.run(repo.get_shared_chat(OWNER_ID)) is None
+        # Запланировано удаление всех чатов: отдельный (100) + общий (200)
+        assert sched_reset.call_count == 1
+        call_kwargs = sched_reset.call_args.kwargs
+        assert call_kwargs["separate_chat_ids"] == [100]
+        assert call_kwargs["shared_chat_id"] == 200
+
+
+class TestCleanupNotices:
+    def test_failed_deletion_writes_notice_and_endpoint_exposes_it(self, client):
+        """
+        Ошибка удаления чата (в фоновой задаче) записывает явное уведомление,
+        которое отдаётся через GET /api/portals/notices ровно ОДИН раз: первое
+        чтение возвращает заметку и сразу удаляет её, поэтому повторный GET
+        (например после перезапуска приложения) уже пуст — уведомление не
+        всплывает снова.
+        """
+        from app.poller import finish_disconnect_chats
+        from app.vibe_client import VibeApiError
+        from app.repositories import external_portals as repo
+
+        with patch(
+            "app.poller.delete_group_chat",
+            new_callable=AsyncMock,
+            side_effect=VibeApiError(500, {"error": "boom"}),
+        ):
+            asyncio.run(
+                finish_disconnect_chats(
+                    owner_user_id=OWNER_ID,
+                    separate_chat_id=1,
+                    shared_chat_id=None,
+                )
+            )
+
+        notices = asyncio.run(repo.list_cleanup_notices(OWNER_ID))
+        assert len(notices) == 1
+        assert "Не удалось удалить отдельный чат" in notices[0]
+        # В текст уведомления попадает краткая причина сбоя (статус/код
+        # платформы) — иначе в UI было бы не видно, почему чат не удалился.
+        assert "Причина:" in notices[0]
+        assert "500" in notices[0]
+
+        # Виджет читает уведомление через API (первый показ)
+        got = client.get("/api/portals/notices").json()
+        assert got == notices
+        # Повторное чтение (после перезагрузки/перезапуска) уже пусто —
+        # уведомление показано ровно один раз и удалено при первой выдаче.
+        assert client.get("/api/portals/notices").json() == []
 
 
 class TestValidators:

@@ -23,6 +23,7 @@ def _portal(**overrides) -> ExternalPortal:
         domain="ext.example.ru",
         auth_type="webhook",
         credentials="https://ext.example.ru/rest/1/token/",
+        portal_domain="ext.example.ru",
         main_chat_id=42,
         last_message_cursor={},
         status="active",
@@ -65,6 +66,26 @@ class TestFormatDigest:
         # разворачивает голый URL в большую карточку-превью на каждое
         # сообщение (см. poller.py, _format_digest).
         assert "[url=https://ext.example.ru/online/?IM_DIALOG=chat1317]Открыть диалог[/url]" in text
+
+    def test_link_uses_real_portal_domain_not_human_readable_name(self):
+        """Человекочитаемое название портала (домен) не обязано совпадать с
+        настоящим доменом — ссылка «Открыть диалог» строится от реального
+        домена (portal_domain из URL вебхука), а в заголовке показывается
+        заданное пользователем название."""
+        portal = _portal(domain="Семья", portal_domain="real.example.ru")
+        text = _format_digest(portal, [_msg()])
+
+        # Заголовок — человекочитаемое название, а не домен
+        assert "Портал: Семья" in text
+        # Ссылка — от реального домена
+        assert "https://real.example.ru/online/?IM_DIALOG=chat1317" in text
+        assert "ext.example.ru" not in text
+
+    def test_link_falls_back_to_domain_when_portal_domain_empty(self):
+        """Для старых записей без portal_domain ссылка собирается от domain."""
+        portal = _portal(domain="ext.example.ru", portal_domain=None)
+        text = _format_digest(portal, [_msg()])
+        assert "https://ext.example.ru/online/?IM_DIALOG=chat1317" in text
 
     def test_multiple_messages_are_ordered_chronologically_regardless_of_input_order(self):
         portal = _portal()

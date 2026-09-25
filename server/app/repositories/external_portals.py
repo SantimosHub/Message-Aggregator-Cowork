@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+import logging
 from typing import Literal, Optional
 
 import aiosqlite
 
 from ..crypto import decrypt_credentials, encrypt_credentials
+from ..crypto import CredentialsCryptoError
 from ..db import get_connection
+
+logger = logging.getLogger("message_aggregator.external_portals")
 
 AuthType = Literal["webhook"]  # vibe_api как способ авторизации внешнего портала убран, см. external_portal_client.py
 # 'connecting' — переходный статус сразу после POST /api/portals, пока
@@ -32,6 +36,9 @@ class ExternalPortal:
     domain: str
     auth_type: AuthType
     credentials: str  # уже расшифровано — обращаться с осторожностью, не логировать!
+    # Реальный домен внешнего портала (host из URL вебхука) — для ссылок
+    # «Открыть диалог» в дайджестах; `domain` же — человекочитаемое название.
+    portal_domain: Optional[str]
     main_chat_id: Optional[int]
     last_message_cursor: dict[str, str]  # {dialog_id: last_message_id}
     status: PortalStatus
@@ -42,20 +49,74 @@ class ExternalPortal:
 
 
 def _row_to_portal(row: aiosqlite.Row) -> ExternalPortal:
+    # Не позволяем одной «битой» строке (нерасшифровываемый credentials, сломанный
+    # last_message_cursor и т.п. из старой БД) уронить ВЕСЬ список порталов в 500.
+    # Такая запись возвращается объектом-заглушкой: остаётся видимой в виджете и
+    # удаляемой через DELETE, а остальные записи читаются как обычно.
+    try:
+        credentials = decrypt_credentials(row["credentials"])
+        cursor = json.loads(row["last_message_cursor"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Запись портала id=%s не может быть разобрана (%s: %s) — "
+            "показываю с заглушкой, требуется удалить/переподключить",
+            row["id"], type(exc).__name__, exc,
+        )
+        try:
+            raw_id = int(row["id"])
+        except Exception:  # noqa: BLE001
+            raw_id = 0
+        try:
+            raw_owner = int(row["owner_user_id"])
+        except Exception:  # noqa: BLE001
+            raw_owner = 0
+        return ExternalPortal(
+            id=raw_id,
+            owner_user_id=raw_owner,
+            domain=str(row["domain"] or ""),
+            auth_type="webhook",
+            credentials="",
+            portal_domain=None,
+            main_chat_id=None,
+            last_message_cursor={},
+            status=str(row["status"] or "error"),
+            error_message=f"Запись не может быть расшифрована: {type(exc).__name__}: {exc}",
+            owner_external_user_id=None,
+            chat_mode="separate",
+            created_at=str(row["created_at"] or ""),
+        )
     return ExternalPortal(
         id=row["id"],
         owner_user_id=row["owner_user_id"],
         domain=row["domain"],
         auth_type=row["auth_type"],
-        credentials=decrypt_credentials(row["credentials"]),
+        credentials=credentials,
+        portal_domain=row["portal_domain"],
         main_chat_id=row["main_chat_id"],
-        last_message_cursor=json.loads(row["last_message_cursor"]),
+        last_message_cursor=cursor,
         status=row["status"],
         error_message=row["error_message"],
         owner_external_user_id=row["owner_external_user_id"],
         chat_mode=row["chat_mode"],
         created_at=row["created_at"],
     )
+
+
+def _extract_webhook_domain(webhook_url: str) -> Optional[str]:
+    """Извлекает host внешнего портала из URL вебхука (credentials), например
+    https://crm.example.ru/rest/1/token/ -> crm.example.ru. Не секрет; NULL,
+    если URL непохож на вебхук."""
+    from urllib.parse import urlparse
+
+    url = (webhook_url or "").strip()
+    if not url:
+        return None
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        return urlparse(url).hostname
+    except ValueError:
+        return None
 
 
 async def create_portal(
@@ -75,14 +136,15 @@ async def create_portal(
     одной транзакции с синхронным исходящим запросом прямо в обработчике,
     что ломалось на туннеле Gateway)."""
     encrypted = encrypt_credentials(credentials)
+    portal_domain = _extract_webhook_domain(credentials)
     async with get_connection() as conn:
         cursor = await conn.execute(
             """
             INSERT INTO external_portals
-                (owner_user_id, domain, auth_type, credentials, main_chat_id, last_message_cursor, status, chat_mode)
-            VALUES (?, ?, ?, ?, ?, '{}', 'connecting', ?)
+                (owner_user_id, domain, auth_type, credentials, portal_domain, main_chat_id, last_message_cursor, status, chat_mode)
+            VALUES (?, ?, ?, ?, ?, ?, '{}', 'connecting', ?)
             """,
-            (owner_user_id, domain, auth_type, encrypted, main_chat_id, chat_mode),
+            (owner_user_id, domain, auth_type, encrypted, portal_domain, main_chat_id, chat_mode),
         )
         await conn.commit()
         portal_id = cursor.lastrowid
@@ -209,6 +271,99 @@ async def update_cursor(portal_id: int, cursor: dict[str, str]) -> None:
 async def delete_portal(portal_id: int) -> None:
     async with get_connection() as conn:
         await conn.execute("DELETE FROM external_portals WHERE id = ?", (portal_id,))
+        await conn.commit()
+
+
+async def count_portals_by_owner(owner_user_id: int) -> int:
+    """
+    Число оставшихся порталов сотрудника. Используется при отключении,
+    чтобы понять, был ли удалённый портал последним (тогда удаляем и
+    общий чат «Сборщик сообщений», см. routes/portals.py).
+    """
+    async with get_connection() as conn:
+        async with conn.execute(
+            "SELECT COUNT(*) AS c FROM external_portals WHERE owner_user_id = ?",
+            (owner_user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row["c"])
+
+
+async def delete_shared_chat(owner_user_id: int) -> None:
+    """Удаляет запись общего чата «Сборщик сообщений» сотрудника."""
+    async with get_connection() as conn:
+        await conn.execute(
+            "DELETE FROM shared_chats WHERE owner_user_id = ?", (owner_user_id,)
+        )
+        await conn.commit()
+
+
+async def delete_all_portals(owner_user_id: int) -> None:
+    """Удаляет ВСЕ записи внешних порталов сотрудника (массовый сброс)."""
+    async with get_connection() as conn:
+        await conn.execute(
+            "DELETE FROM external_portals WHERE owner_user_id = ?", (owner_user_id,)
+        )
+        await conn.commit()
+
+
+async def add_cleanup_notice(owner_user_id: int, message: str) -> None:
+    """Добавляет явное уведомление для сотрудника (например, об ошибке очистки чата)."""
+    async with get_connection() as conn:
+        await conn.execute(
+            "INSERT INTO cleanup_notices (owner_user_id, message) VALUES (?, ?)",
+            (owner_user_id, message),
+        )
+        await conn.commit()
+
+
+async def list_cleanup_notices(owner_user_id: int) -> list[str]:
+    """Возвращает непрочитанные уведомления сотрудника (самые свежие первыми)."""
+    async with get_connection() as conn:
+        async with conn.execute(
+            """
+            SELECT message FROM cleanup_notices
+            WHERE owner_user_id = ?
+            ORDER BY id DESC
+            """,
+            (owner_user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [row["message"] for row in rows]
+
+
+async def take_cleanup_notices(owner_user_id: int) -> list[str]:
+    """
+    Возвращает непрочитанные уведомления сотрудника (самые свежие первыми)
+    и СРАЗУ удаляет их из БД: каждое уведомление показывается ровно ОДИН раз
+    (при первом чтении виджетом) и больше не всплывает даже после перезапуска
+    приложения — заметки об ошибках очистки чатов не должны «накапливаться»
+    и перепоказываться при каждой загрузке страницы.
+    """
+    async with get_connection() as conn:
+        async with conn.execute(
+            """
+            SELECT message FROM cleanup_notices
+            WHERE owner_user_id = ?
+            ORDER BY id DESC
+            """,
+            (owner_user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        messages = [row["message"] for row in rows]
+        await conn.execute(
+            "DELETE FROM cleanup_notices WHERE owner_user_id = ?", (owner_user_id,)
+        )
+        await conn.commit()
+    return messages
+
+
+async def clear_cleanup_notices(owner_user_id: int) -> None:
+    """Удаляет все уведомления сотрудника после их показа."""
+    async with get_connection() as conn:
+        await conn.execute(
+            "DELETE FROM cleanup_notices WHERE owner_user_id = ?", (owner_user_id,)
+        )
         await conn.commit()
 
 

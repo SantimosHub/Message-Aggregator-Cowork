@@ -92,6 +92,35 @@ def build_source_archive() -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def bump_app_version() -> str | None:
+    """
+    Поднимает версию приложения на 0.01 ПЕРЕД каждым деплоем.
+
+    Единый источник версии — server/version.txt (та же версия, что сервер
+    подставляет в виджет вместо __APP_VERSION__, см. app/main.py). Вызывается
+    на Шаге 3 ДО сборки архива, чтобы в задеплоенный tar.gz уже попал
+    обновлённый version.txt — иначе после публикации версия в интерфейсе
+    не изменилась бы (регресс, замеченный вручную после передеплоев).
+
+    Возвращает новую версию или None, если поднять не удалось (тогда деплой
+    продолжается с текущей версией — потеряем лишь инкремент, не ломаем деплой).
+    """
+    bump_path = Path(__file__).resolve().parent / "bump_version.py"
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("_app_bump_version", str(bump_path))
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)  # НЕ исполняет `if __name__ == "__main__"`
+        new_version = module.bump()
+        print(f"  Версия приложения поднята до {new_version}")
+        return new_version
+    except Exception as exc:  # noqa: BLE001 — не должны ронять деплой
+        print(f"  ВНИМАНИЕ: не удалось поднять версию приложения ({exc}) — продолжаю с текущей.")
+        return None
+
+
 def main() -> None:
     api_key = os.environ.get("VIBE_API_KEY")
     if not api_key:
@@ -148,6 +177,7 @@ def main() -> None:
         sys.exit(1)
 
     print(f"\nШаг 3. Собираю архив исходников из {SERVER_DIR}...")
+    bump_app_version()
     source_content = build_source_archive()
 
     app_env = load_app_env()
@@ -173,12 +203,15 @@ def main() -> None:
     if existing_server_id:
         print(f"\nШаг 4. Передеплоиваю существующий сервер (id={existing_server_id})...")
         resp = None
+        # Таймаут должен быть заметно больше времени сборки (pip install +
+        # запуск), иначе мы обрываем запрос, сборка рвётся и сервер остаётся
+        # на СТАРОЙ версии — а статус running это не покажет.
         try:
-            with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=300) as client:
+            with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=900) as client:
                 resp = client.post(f"/v1/infra/servers/{existing_server_id}/deploy", headers=headers, json=payload)
         except httpx.TimeoutException:
             print(
-                "  Запрос не дождался ответа за 300 сек — но сборка могла всё равно "
+                "  Запрос не дождался ответа за 900 сек — но сборка могла всё равно "
                 "запуститься на платформе. Проверяю статус сервера напрямую (Шаг 5), "
                 "не завершая скрипт с ошибкой."
             )
@@ -214,18 +247,31 @@ def main() -> None:
     print(f"\nШаг 5. Сервер создаётся (id={server_id}). Опрашиваю статус...")
     public_url = initial_url
     with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=20) as client:
-        for attempt in range(20):
-            time.sleep(6)
+        # Опрашиваем дольше, чем раньше (было 20*6=120с) — сборка galaxy может
+        # идти несколько минут. Печатаем не только status, но и признаки того,
+        # применилась ли новая версия / нет ли ошибки сборки.
+        for attempt in range(40):
+            time.sleep(10)
             r = client.get(f"/v1/infra/servers/{server_id}", headers=headers)
             info = r.json().get("data", r.json())
             status = info.get("status")
             bh_status = info.get("blackholeStatus")
             public_url = info.get("appUrl") or info.get("url") or info.get("publicUrl") or info.get("domain")
-            print(f"  [{attempt + 1}/20] status={status} blackholeStatus={bh_status} url={public_url}")
+            build_log = info.get("buildLog") or info.get("provisionError") or info.get("provisionErrorCode")
+            line = f"  [{attempt + 1}/40] status={status} blackholeStatus={bh_status} url={public_url}"
+            if build_log:
+                line += f"  BUG|cборка|error: {str(build_log)[-200:]}"
+            print(line)
             if status == "running" and public_url:
                 break
 
     print("\nГотово (или сервер ещё разворачивается — см. последний статус выше).")
+    with httpx.Client(base_url=VIBE_API_BASE_URL, timeout=20) as client:
+        st = client.get(f"/v1/infra/servers/{server_id}", headers=headers).json().get("data", {})
+        print("\n  Сводка последнего состояния сервера:")
+        for key in ("status", "blackholeStatus", "provisionError", "provisionErrorCode", "buildLog", "appUrl"):
+            if st.get(key):
+                print(f"    {key}: {str(st.get(key))[-300:]}")
     if public_url:
         print(f"\nAPP_BASE_URL для .env: {public_url}")
         print("Дальше: заполни APP_BASE_URL в server/.env и запусти scripts/bind_placement.py")

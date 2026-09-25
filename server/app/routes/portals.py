@@ -20,16 +20,23 @@ Gateway в принципе не делаем — независимо от сп
 """
 from __future__ import annotations
 
+import logging
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_owner_user_id
-from ..poller import schedule_finish_connecting
+from ..poller import (
+    schedule_finish_connecting,
+    schedule_finish_disconnect,
+    schedule_finish_reset,
+)
 from ..repositories import external_portals as repo
 
 router = APIRouter(prefix="/api/portals", tags=["external-portals"])
+
+logger = logging.getLogger("message_aggregator.portals")
 
 
 class ConnectPortalRequest(BaseModel):
@@ -71,8 +78,25 @@ class PortalResponse(BaseModel):
 @router.get("", response_model=list[PortalResponse])
 async def list_my_portals(owner_user_id: int = Depends(get_current_owner_user_id)) -> list[PortalResponse]:
     """Список внешних порталов текущего сотрудника (полезно для проверки до появления UI, Этап 6)."""
-    portals = await repo.list_portals_by_owner(owner_user_id)
-    return [PortalResponse.from_portal(p) for p in portals]
+    try:
+        portals = await repo.list_portals_by_owner(owner_user_id)
+        return [PortalResponse.from_portal(p) for p in portals]
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # GET раньше не был обёрнут в try/except (в отличие от POST), поэтому
+        # любое исключение здесь — например, CredentialsCryptoError при
+        # расшифровке записей из БД — уходило в общий перехват FastAPI и
+        # отдавалось плоским "Internal Server Error" БЕЗ деталей. Логируем
+        # полный traceback и возвращаем JSON с причиной, чтобы её было видно
+        # сразу в /api/portals.
+        logger.exception(
+            "Не удалось загрузить список порталов сотрудника %s: %s", owner_user_id, exc
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось загрузить список порталов: {type(exc).__name__}: {exc}",
+        ) from exc
 
 
 @router.post("", response_model=PortalResponse, status_code=201)
@@ -119,10 +143,93 @@ async def connect_portal(
     return PortalResponse.from_portal(portal)
 
 
+@router.get("/notices", response_model=list[str])
+async def get_my_cleanup_notices(owner_user_id: int = Depends(get_current_owner_user_id)) -> list[str]:
+    """
+    Явные уведомления для сотрудника (в т.ч. об ошибках очистки чатов).
+    Отдаёт список сообщений и СРАЗУ удаляет их — каждое уведомление
+    показывается ровно один раз и не всплывает снова после перезапуска
+    приложения или перезагрузки страницы (см. take_cleanup_notices).
+    """
+    return await repo.take_cleanup_notices(owner_user_id)
+
+
+@router.delete("/notices", status_code=204)
+async def clear_my_cleanup_notices(owner_user_id: int = Depends(get_current_owner_user_id)) -> None:
+    """Очищает все уведомления сотрудника после их показа."""
+    await repo.clear_cleanup_notices(owner_user_id)
+
+
 @router.delete("/{portal_id}", status_code=204)
 async def disconnect_portal(portal_id: int, owner_user_id: int = Depends(get_current_owner_user_id)) -> None:
-    """Отключение внешнего портала. Проверяем, что удаляет владелец записи, а не чужую."""
+    """
+    Отключение внешнего портала. Проверяем, что удаляет владелец записи, а не чужую.
+
+    Помимо удаления записи в БД:
+    - если портал был в режиме 'separate' — удаляем его отдельный чат
+      «Сборщик сообщений: {портал}» на основном портале;
+    - если это был последний портал сотрудника — удаляем и общий чат
+      «Сборщик сообщений».
+
+    Удаление чатов — сетевые вызовы к основному порталу, поэтому они идут
+    отдельной фоновой задачей ВНЕ обработчика (см. finish_disconnect_chats),
+    а здесь мы только решаем, что удалять, удаляем запись из БД и запускаем
+    задачу. Ответ 204 отдаётся сразу, без ожидания сетевых вызовов.
+    """
     portal = await repo.get_portal(portal_id)
     if portal is None or portal.owner_user_id != owner_user_id:
         raise HTTPException(status_code=404, detail="Портал не найден")
+
+    separate_chat_id = portal.main_chat_id if portal.chat_mode == "separate" else None
+
+    # Был ли этот портал последним у сотрудника (ДО удаления записи) —
+    # если да, после удаления общий чат «Сборщик сообщений» больше не нужен.
+    was_last_portal = (await repo.count_portals_by_owner(owner_user_id)) == 1
+    shared_chat_id = await repo.get_shared_chat(owner_user_id) if was_last_portal else None
+
     await repo.delete_portal(portal_id)
+    if shared_chat_id is not None:
+        # Запись общего чата больше не нужна — отключаемый портал был последним.
+        await repo.delete_shared_chat(owner_user_id)
+
+    if separate_chat_id is not None or shared_chat_id is not None:
+        schedule_finish_disconnect(
+            owner_user_id=owner_user_id,
+            separate_chat_id=separate_chat_id,
+            shared_chat_id=shared_chat_id,
+        )
+
+
+@router.post("/reset", status_code=200)
+async def reset_all_settings(owner_user_id: int = Depends(get_current_owner_user_id)) -> dict:
+    """
+    Массовый сброс настроек сотрудника: отключает ВСЕ его внешние порталы
+    (независимо от статуса) и удаляет все чаты, созданные приложением.
+
+    - Удаляет все записи `external_portals` сотрудника.
+    - Удаляет запись общего чата «Сборщик сообщений» (если есть).
+    - Удаление самих чатов на основном портале (отдельные чаты порталов +
+      общий чат) идёт отдельной фоновой задачей (`schedule_finish_reset`),
+      т.к. это сетевые вызовы к Бот-платформе (тот же Gateway-баг, что и при
+      создании/удалении чата). Ответ возвращается сразу.
+    """
+    portals = await repo.list_portals_by_owner(owner_user_id)
+    separate_chat_ids = [
+        p.main_chat_id
+        for p in portals
+        if p.chat_mode == "separate" and p.main_chat_id is not None
+    ]
+    shared_chat_id = await repo.get_shared_chat(owner_user_id)
+
+    await repo.delete_all_portals(owner_user_id)
+    if shared_chat_id is not None:
+        await repo.delete_shared_chat(owner_user_id)
+
+    if separate_chat_ids or shared_chat_id is not None:
+        schedule_finish_reset(
+            owner_user_id=owner_user_id,
+            separate_chat_ids=separate_chat_ids,
+            shared_chat_id=shared_chat_id,
+        )
+
+    return {"status": "reset", "portals_removed": len(portals)}

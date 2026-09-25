@@ -110,6 +110,67 @@
   .btn-danger-text:hover { color: var(--error); background: var(--error-soft); }
   .btn-danger-text.confirming { color: var(--error); background: var(--error-soft); }
 
+  .btn-reset-settings {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 50;
+    background: var(--surface);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    padding: 8px 14px;
+    font-weight: 500;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+  .btn-reset-settings:hover {
+    color: var(--error);
+    border-color: var(--error);
+  }
+  .btn-reset-settings:disabled {
+    color: var(--text-muted);
+    border-color: var(--border);
+    cursor: default;
+  }
+  .app-version {
+    position: fixed;
+    left: 50%;
+    bottom: 16px;
+    transform: translateX(-50%);
+    z-index: 45;
+    color: var(--text-muted);
+    font-size: 12px;
+    opacity: 0.7;
+    user-select: none;
+  }
+
+  #notices { margin-bottom: 12px; }
+  .notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    background: var(--error-soft, #fdf0ee);
+    border: 1px solid var(--error, #e0544b);
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: var(--error, #a33a33);
+    font-size: 13px;
+    line-height: 1.4;
+    margin-bottom: 8px;
+  }
+  .notice-close {
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    flex-shrink: 0;
+  }
+
   /* ---------- Форма добавления ---------- */
   .add-form {
     background: var(--surface);
@@ -364,6 +425,8 @@
     <button class="btn-primary" id="toggle-form-btn" type="button">+ Подключить портал</button>
   </div>
 
+  <div id="notices"></div>
+
   <form class="add-form" id="add-form" novalidate>
     <div class="form-error" id="form-error" role="alert"></div>
 
@@ -408,6 +471,9 @@
       <div class="skeleton-card"></div>
     </div>
   </div>
+
+  <button class="btn-reset-settings" id="reset-settings-btn" type="button">Сброс настроек</button>
+  <div class="app-version" id="app-version">V __APP_VERSION__</div>
 
 </div>
 
@@ -560,6 +626,20 @@
       return;
     }
 
+    // Предупреждение перед фактическим отключением: чат на основном портале
+    // будет удалён (для портала в отдельном режиме — отдельный чат; если это
+    // последний портал — также общий чат «Сборщик сообщений»). Сервер сам
+    // решает, какой чат снести, поэтому текст предупреждения — общий.
+    var chatMode = btnEl.getAttribute("data-chat-mode");
+    var chatMsg = chatMode === "separate"
+      ? "Отдельный чат «Сборщик сообщений», связанный с этим порталом, будет удалён."
+      : "Если это последний портал — будет удалён и общий чат «Сборщик сообщений».";
+    if (!window.confirm("Отключить портал?\n\n" + chatMsg)) {
+      btnEl.classList.remove("confirming");
+      btnEl.textContent = "Отключить";
+      return;
+    }
+
     btnEl.disabled = true;
     btnEl.textContent = "Отключаем…";
 
@@ -569,6 +649,13 @@
           throw new Error("Не удалось отключить портал.");
         }
         loadPortals();
+        // Уведомление об ошибке очистки чата пишется асинхронной фоновой
+        // задачей (сетевые вызовы к Бот-платформе идут вне обработчика и
+        // могут занимать десятки секунд — таймауты исходящих вызовов), поэтому
+        // после удаления портала опрашиваем notices с интервалом, пока не
+        // придёт результат — иначе уведомление показалось бы только после
+        // перезагрузки страницы.
+        startNoticesPolling();
       })
       .catch(function () {
         btnEl.disabled = false;
@@ -626,7 +713,7 @@
         '</div>' +
         (hint ? '<div class="card-error-hint">' + hint + '</div>' : '') +
         '</div>' +
-        '<button class="btn-danger-text" data-portal-id="' + p.id + '" type="button">Отключить</button>' +
+        '<button class="btn-danger-text" data-portal-id="' + p.id + '" data-chat-mode="' + p.chat_mode + '" type="button">Отключить</button>' +
         '</div>';
     });
     html += '</div>';
@@ -691,7 +778,119 @@
       });
   }
 
+  // ---------- Уведомления об ошибках очистки ----------
+  function renderNotices(notices) {
+    var el = document.getElementById("notices");
+    if (!el) return;
+    if (!notices || notices.length === 0) {
+      el.innerHTML = "";
+      return;
+    }
+    var html = notices.map(function (m) {
+      return (
+        '<div class="notice">' +
+        '<span class="notice-msg">' + escapeHtml(m) + '</span>' +
+        '<button class="notice-close" type="button" aria-label="Закрыть">&times;</button>' +
+        '</div>'
+      );
+    }).join("");
+    el.innerHTML = html;
+    el.querySelectorAll(".notice-close").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        // Скрыть заметку; уведомления считаем показанными — очищаем на сервере.
+        el.innerHTML = "";
+        fetchWithRetry(API_BASE + "/notices", { method: "DELETE", credentials: "same-origin" })
+          .catch(function () { /* не критично — покажем снова при следующей загрузке */ });
+      });
+    });
+  }
+
+  function loadNotices(onDone) {
+    fetchWithRetry(API_BASE + "/notices", { credentials: "same-origin" })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("notices");
+        return resp.json();
+      })
+      .then(function (notices) {
+        renderNotices(notices);
+        if (typeof onDone === "function") onDone(notices && notices.length > 0);
+      })
+      .catch(function () {
+        if (typeof onDone === "function") onDone(false);
+      });
+  }
+
+  // Интервальный опрос уведомлений после отключения портала / сброса настроек.
+  // Фоновая задача сервера пишет уведомление об ошибке очистки чата, только
+  // когда сетевой вызов удаления завершится (иногда через десятки секунд из-за
+  // таймаутов), поэтому одного запроса мало — опрашиваем каждые 3 секунды до
+  // появления заметки или до истечения лимита (~60 с), затем останавливаемся.
+  var NOTICES_POLL_INTERVAL_MS = 3000;
+  var NOTICES_POLL_MAX_TICKS = 20;
+  var noticesPollTimer = null;
+  var noticesPollTicksLeft = 0;
+
+  function stopNoticesPolling() {
+    if (noticesPollTimer !== null) {
+      clearInterval(noticesPollTimer);
+      noticesPollTimer = null;
+    }
+    noticesPollTicksLeft = 0;
+  }
+
+  function pollNoticesOnce() {
+    loadNotices(function (found) {
+      if (found || noticesPollTicksLeft <= 0) {
+        stopNoticesPolling();
+        return;
+      }
+      noticesPollTicksLeft -= 1;
+    });
+  }
+
+  function startNoticesPolling() {
+    stopNoticesPolling();
+    noticesPollTicksLeft = NOTICES_POLL_MAX_TICKS;
+    pollNoticesOnce();
+    noticesPollTimer = setInterval(pollNoticesOnce, NOTICES_POLL_INTERVAL_MS);
+  }
+
+  // ---------- Сброс настроек ----------
+  var elResetBtn = document.getElementById("reset-settings-btn");
+  if (elResetBtn) {
+    elResetBtn.addEventListener("click", function () {
+      var ok = window.confirm(
+        "Сбросить настройки?\n\nВсе подключённые порталы будут отключены, " +
+        "а все чаты, созданные приложением (включая общий чат «Сборщик сообщений»), " +
+        "будут удалены. Это действие нельзя отменить."
+      );
+      if (!ok) return;
+
+      elResetBtn.disabled = true;
+      elResetBtn.textContent = "Сбрасываем…";
+
+      fetchWithRetry(API_BASE + "/reset", { method: "POST", credentials: "same-origin" })
+        .then(function (resp) {
+          if (!resp.ok) {
+            throw new Error("Не удалось выполнить сброс.");
+          }
+          return resp.json();
+        })
+        .then(function () {
+          elResetBtn.disabled = false;
+          elResetBtn.textContent = "Сброс настроек";
+          loadPortals();
+          startNoticesPolling();
+        })
+        .catch(function () {
+          elResetBtn.disabled = false;
+          elResetBtn.textContent = "Сброс настроек";
+        });
+    });
+  }
+
   loadPortals();
+  loadNotices();
 })();
 </script>
 </body>
