@@ -11,6 +11,7 @@ from .poller import start_poller
 from .routes.portals import router as portals_router
 
 WIDGET_INDEX_PATH = Path(__file__).resolve().parent.parent / "widget" / "index.html"
+DEBUG_INDEX_PATH = Path(__file__).resolve().parent.parent / "widget" / "debug.html"
 APP_VERSION_PATH = Path(__file__).resolve().parent.parent / "version.txt"
 
 app = FastAPI(title="Bitrix24 Message Aggregator")
@@ -88,3 +89,17 @@ async def whoami(owner_user_id: int = Depends(get_current_owner_user_id)) -> dic
     Реальный UI списка внешних порталов появится на Этапе 6.
     """
     return {"owner_user_id": owner_user_id}
+
+
+@app.get("/debug", include_in_schema=False)
+async def debug_index() -> HTMLResponse:
+    """
+    Диагностика опроса порталов: трасса последнего цикла по каждому порталу
+    (что нашёл опрос, сколько входящих переслал, какой курсор). Данные — из
+    собственной БД (portal_diagnostics), без прод-логов платформы.
+    """
+    try:
+        html = DEBUG_INDEX_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return HTMLResponse("widget/debug.html не найден", status_code=500)
+    return HTMLResponse(content=html, headers={"Cache-Control": "no-cache"})

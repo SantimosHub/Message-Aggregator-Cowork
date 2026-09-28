@@ -367,6 +367,54 @@ async def clear_cleanup_notices(owner_user_id: int) -> None:
         await conn.commit()
 
 
+async def save_portal_diagnostics(portal_id: int, owner_user_id: int, payload: dict) -> None:
+    """Сохраняет трассу последнего цикла опроса портала (одна строка на портал,
+    upsert). Нужна для экрана «Диагностика» в виджете."""
+    async with get_connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO portal_diagnostics (portal_id, owner_user_id, payload, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(portal_id) DO UPDATE SET
+                owner_user_id = excluded.owner_user_id,
+                payload     = excluded.payload,
+                updated_at  = excluded.updated_at
+            """,
+            (portal_id, owner_user_id, json.dumps(payload, ensure_ascii=False)),
+        )
+        await conn.commit()
+
+
+async def list_portal_diagnostics(owner_user_id: int) -> list[dict]:
+    """Возвращает трассы последних циклов опроса всех порталов сотрудника
+    (самые свежие первыми). payload распарсен обратно в dict."""
+    async with get_connection() as conn:
+        async with conn.execute(
+            """
+            SELECT portal_id, payload, updated_at
+            FROM portal_diagnostics
+            WHERE owner_user_id = ?
+            ORDER BY datetime(updated_at) DESC
+            """,
+            (owner_user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    result = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (ValueError, TypeError):
+            payload = {}
+        result.append(
+            {
+                "portal_id": row["portal_id"],
+                "updated_at": row["updated_at"],
+                "trace": payload,
+            }
+        )
+    return result
+
+
 async def set_chat_mode(portal_id: int, chat_mode: ChatMode) -> None:
     """Обновляет chat_mode портала (shared/separate)."""
     async with get_connection() as conn:

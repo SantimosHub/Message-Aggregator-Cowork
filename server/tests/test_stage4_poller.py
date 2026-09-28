@@ -81,6 +81,8 @@ class TestFetchNewMessagesRegularDialog:
         async def fake_call(portal_arg, method, params):
             if method == "im.recent.list":
                 return RECENT_LIST_ONE_CHAT
+            if method == "im.counters.get":
+                return {}
             if method == "im.dialog.messages.get":
                 assert params["DIALOG_ID"] == "chat1317"
                 return DIALOG_MESSAGES_RESPONSE
@@ -95,12 +97,13 @@ class TestFetchNewMessagesRegularDialog:
         assert new_cursor == {"chat1317": "100"}
 
     @pytest.mark.asyncio
-    async def test_read_messages_are_not_forwarded(self):
+    async def test_own_messages_not_forwarded_but_incoming_are(self):
         """
-        unread=false — сотрудник либо сам написал это сообщение (свои
-        исходящие не бывают непрочитанными для себя же), либо уже прочитал
-        его на внешнем портале напрямую. Ни то, ни другое пересылать не
-        нужно (см. docstring external_message_fetcher.py).
+        Собственные исходящие сотрудника (author_id == owner_external_user_id)
+        не пересылаются, даже если они ещё "unread". А вот прочитанные
+        ВХОДЯЩИЕ сообщения клиента пересылаются: раньше фильтр по unread
+        навсегда терял входящее, если пользователь успел прочитать его на
+        внешнем портале до опроса (см. external_message_fetcher.py).
         """
         recent = {
             "items": [
@@ -125,14 +128,18 @@ class TestFetchNewMessagesRegularDialog:
         async def fake_call(portal_arg, method, params):
             if method == "im.recent.list":
                 return recent
+            if method == "im.counters.get":
+                return {}
             if method == "im.dialog.messages.get":
                 return messages_response
             raise AssertionError(f"unexpected method {method}")
 
-        portal = _portal(last_message_cursor={"chat1317": "100"})
+        portal = _portal(last_message_cursor={"chat1317": "100"}, owner_external_user_id="900")
         with patch("app.external_message_fetcher._call_method", side_effect=fake_call):
             messages, new_cursor = await fetch_new_messages(portal)
 
+        # 101 — "мой собственный ответ" (владелец 900): своих не пересылаем.
+        # А вот 102 — прочитанное входящее клиента: пересылается.
         assert [m.message_id for m in messages] == [102]
         assert messages[0].text == "новое от клиента"
         # Курсор продвигается до последнего id из im.recent.list (102), а не
@@ -152,9 +159,12 @@ class TestFetchNewMessagesRegularDialog:
 
         assert messages == []
         assert new_cursor == {"chat1317": "100"}
-        # Только im.recent.list должен был вызваться, НЕ im.dialog.messages.get
-        call.assert_called_once()
-        assert call.call_args[0][1] == "im.recent.list"
+        # Список диалогов берём из im.recent.list + im.counters.get,
+        # а НЕ im.dialog.messages.get (нет нового — сообщения не читаем).
+        methods = [args[0][1] for args in call.call_args_list]
+        assert "im.recent.list" in methods
+        assert "im.counters.get" in methods
+        assert "im.dialog.messages.get" not in methods
 
 
 class TestFetchNewMessagesOpenLine:
@@ -182,6 +192,8 @@ class TestFetchNewMessagesOpenLine:
         async def fake_call(portal_arg, method, params):
             if method == "im.recent.list":
                 return recent
+            if method == "im.counters.get":
+                return {}
             if method == "imopenlines.session.history.get":
                 assert params["CHAT_ID"] == 2001
                 return history
@@ -225,6 +237,8 @@ class TestFetchNewMessagesOpenLine:
         async def fake_call(portal_arg, method, params):
             if method == "im.recent.list":
                 return recent
+            if method == "im.counters.get":
+                return {}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -267,6 +281,8 @@ class TestFetchNewMessagesOpenLine:
         async def fake_call(portal_arg, method, params):
             if method == "im.recent.list":
                 return recent
+            if method == "im.counters.get":
+                return {}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -299,6 +315,8 @@ class TestFetchNewMessagesOpenLine:
         async def fake_call(portal_arg, method, params):
             if method == "im.recent.list":
                 return recent
+            if method == "im.counters.get":
+                return {}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -308,6 +326,51 @@ class TestFetchNewMessagesOpenLine:
             messages, new_cursor = await fetch_new_messages(portal)
 
         assert [m.message_id for m in messages] == [71]
+
+    @pytest.mark.asyncio
+    async def test_open_line_first_seen_forwards_only_messages_after_connect(self):
+        """
+        Первое появление открытой линии (first-seen, пустой курсор) не должно
+        выгружать всю прочитанную историю: пересылаются только сообщения,
+        пришедшие ПОСЛЕ подключения портала (portal.created_at) — и первое
+        новое не теряется, и старые прочитанные не дублируются в основной чат.
+        """
+        recent = {
+            "items": [
+                {
+                    "id": "chat2005",
+                    "chat_id": 2005,
+                    "type": "chat",
+                    "title": "Open line #2005",
+                    "message": {"id": 90, "text": "last"},
+                    "lines": {"id": 1, "status": 1},
+                }
+            ]
+        }
+        history = {
+            "message": {
+                "80": {"id": "80", "senderid": "777", "text": "старое до подключения", "date": "2026-01-01T10:00:00+03:00"},
+                "90": {"id": "90", "senderid": "777", "text": "новое после подключения", "date": "2026-01-01T14:00:00+03:00"},
+            }
+        }
+
+        async def fake_call(portal_arg, method, params):
+            if method == "im.recent.list":
+                return recent
+            if method == "im.counters.get":
+                return {}
+            if method == "imopenlines.session.history.get":
+                return history
+            raise AssertionError(f"unexpected method {method}")
+
+        # Порт подключён в 12:00 — сообщение 80 (10:00, до подключения) не
+        # пересылается, 90 (14:00, после) пересылается.
+        portal = _portal(last_message_cursor={}, created_at="2026-01-01 12:00:00")
+        with patch("app.external_message_fetcher._call_method", side_effect=fake_call):
+            messages, new_cursor = await fetch_new_messages(portal)
+
+        assert [m.message_id for m in messages] == [90]
+        assert messages[0].text == "новое после подключения"
 
 
 class TestAuthErrorPropagation:

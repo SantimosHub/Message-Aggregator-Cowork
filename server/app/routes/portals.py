@@ -154,6 +154,16 @@ async def get_my_cleanup_notices(owner_user_id: int = Depends(get_current_owner_
     return await repo.take_cleanup_notices(owner_user_id)
 
 
+@router.get("/diagnostics")
+async def get_my_portal_diagnostics(owner_user_id: int = Depends(get_current_owner_user_id)) -> list[dict]:
+    """
+    Трассы последних циклов опроса каждого портала сотрудника — экран
+    «Диагностика» в виджете (без прод-логов видно, что нашёл опрос в каждый
+    цикл и почему что-то не переслалось). См. save_portal_diagnostics.
+    """
+    return await repo.list_portal_diagnostics(owner_user_id)
+
+
 @router.delete("/notices", status_code=204)
 async def clear_my_cleanup_notices(owner_user_id: int = Depends(get_current_owner_user_id)) -> None:
     """Очищает все уведомления сотрудника после их показа."""

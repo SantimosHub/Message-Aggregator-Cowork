@@ -46,12 +46,17 @@ external_portal_client.py — обходной путь вокруг обрыв�
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
 
 import requests
 
-from .repositories.external_portals import ExternalPortal
+from .repositories.external_portals import ExternalPortal, save_portal_diagnostics
+
+
+logger = logging.getLogger("message_aggregator.external_fetcher")
 
 
 class ExternalPortalApiError(Exception):
@@ -126,7 +131,7 @@ def _author_display_name(user_id, users_map: dict) -> str:
 
 
 async def _fetch_regular_dialog_messages(
-    portal: ExternalPortal, dialog_id: str, after_id: int
+    portal: ExternalPortal, dialog_id: str, after_id: int, *, only_unread: bool = False
 ) -> list[FetchedMessage]:
     result = await _call_method(portal, "im.dialog.messages.get", {"DIALOG_ID": dialog_id, "LIMIT": 50})
     messages = result.get("messages", []) if isinstance(result, dict) else []
@@ -137,12 +142,23 @@ async def _fetch_regular_dialog_messages(
         msg_id = int(msg.get("id", 0))
         if msg_id <= after_id:
             continue
-        # unread с точки зрения владельца вебхука — задокументированное
-        # поле im.dialog.messages.get. Пропускаем прочитанные: это и
-        # собственные исходящие сотрудника (свои сообщения не бывают
-        # непрочитанными для себя же), и то, что он уже прочитал на
-        # внешнем портале напрямую, не отвечая (см. docstring модуля).
-        if not msg.get("unread"):
+        author_id = str(msg.get("author_id")) if msg.get("author_id") is not None else None
+        own = bool(portal.owner_external_user_id and author_id == str(portal.owner_external_user_id))
+        logger.info(
+            "Портал #%s (%s): диалог %s, сообщение id=%s автор=%s (own=%s, owner=%s) unread=%s",
+            portal.id, portal.domain, dialog_id,
+            msg_id, author_id, own, portal.owner_external_user_id, msg.get("unread"),
+        )
+        # Пересылаем ВСЕ новые ВХОДЯЩИЕ (автор ≠ сам сотрудник), включая те,
+        # что сотрудник успел прочитать на внешнем портале до опроса: иначе
+        # прочтение/первое сообщение до пересылки навсегда терялось бы.
+        # Свои исходящие исключаем по автору (owner_external_user_id).
+        if only_unread and not msg.get("unread"):
+            # Для ПЕРВОГО появления диалога (first-seen) пересылаем только
+            # НЕПРОЧИТАННЫЕ входящие — чтобы не выгрузить всю прочитанную
+            # историю чата разом, но и не потерять первое новое сообщение.
+            continue
+        if own:
             continue
         fetched.append(
             FetchedMessage(
@@ -150,8 +166,8 @@ async def _fetch_regular_dialog_messages(
                 dialog_title=dialog_id,
                 is_open_line=False,
                 message_id=msg_id,
-                author_id=str(msg.get("author_id")) if msg.get("author_id") is not None else None,
-                author_name=_author_display_name(msg.get("author_id"), users_map),
+                author_id=author_id,
+                author_name=_author_display_name(author_id, users_map),
                 text=msg.get("text", ""),
                 date=msg.get("date", ""),
             )
@@ -203,6 +219,26 @@ async def _fetch_open_line_messages(
     return fetched
 
 
+def _is_on_or_after_connect(date_str: Optional[str], created_at: Optional[str]) -> bool:
+    """
+    Сравнивает дату сообщения открытой линии с датой подключения портала
+    (portal.created_at). Для first-seen открытой линии пересылаем только
+    сообщения, пришедшие ПОСЛЕ подключения портала — чтобы и первое новое не
+    терялось, и вся прочитанная история не выгружалась разом (в открытой линии,
+    в отличие от обычных диалогов, нет поля unread).
+    """
+    if not date_str or not created_at:
+        return True  # нет данных — не режем (консервативно включаем)
+    try:
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        ct = datetime.strptime(created_at.strip(), "%Y-%m-%d %H:%M:%S")
+        return dt >= ct
+    except (ValueError, TypeError):
+        return True
+
+
 async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessage], dict[str, str]]:
     """
     Опрашивает один внешний портал: находит диалоги с новой активностью
@@ -216,26 +252,130 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
         portal,
         "im.recent.list",
         {
+            # Брать ТОЛЬКО диалоги с непрочитанными сообщениями (UNREAD_ONLY=Y).
+            # Без этого флага im.recent.list отдаёт лишь НЕДАВНИЕ/активные
+            # диалоги, а «спящие» непрочитанные (на которые пользователь не
+            # заходил) теряются за лимитом — сообщения не пересылались, пока
+            # пользователь лично не зашёл на внешний портал (это противоречит
+            # задаче агрегатора: он должен тянуть сообщения в ФОНЕ). Флаг
+            # отбирает именно непрочитанные, а большой LIMIT поднимает потолок
+            # охвата, чтобы непрочитанные не обрезались как при LIMIT=50.
+            "UNREAD_ONLY": "Y",
             "SKIP_OPENLINES": "N",
             "SKIP_DIALOG": "N",
             "SKIP_CHAT": "N",
             "SKIP_UNDISTRIBUTED_OPENLINES": "Y",
-            "LIMIT": 50,
+            "LIMIT": 200,
         },
     )
     items = result.get("items", []) if isinstance(result, dict) else []
 
+    # im.recent.list НЕ отдаёт «спящие» непрочитанные диалоги (те, куда сообщения
+    # пришли, пока пользователь не заходил на портал) — из-за этого сообщения
+    # раньше не пересылались в фоне. Дополняем список диалогами с непрочитанными
+    # из im.counters.get (надёжные счётчики непрочитанных, не зависят от recent).
+    try:
+        counters = await _call_method(portal, "im.counters.get", {})
+    except ExternalPortalApiError:
+        counters = {}
+    counters_data = counters if isinstance(counters, dict) else {}
+    unread_dialog_ids = {}
+    for cid, cnt in (counters_data.get("DIALOG") or {}).items():
+        if cnt:
+            unread_dialog_ids[str(cid)] = True
+    for chat_id, cnt in (counters_data.get("CHAT") or {}).items():
+        if cnt:
+            unread_dialog_ids["chat" + str(chat_id)] = True
+    seen_ids = {str(it.get("id")) for it in items}
+    for dialog_id in unread_dialog_ids:
+        if dialog_id not in seen_ids:
+            # Минимальная запись-заглушка: тип/заголовок узнаем из самих сообщений
+            # (im.dialog.messages.get), а last_id неизвестен (0) — курсор при
+            # первом появлении установится по фактически пересланным сообщениям.
+            items.append({
+                "id": dialog_id,
+                "message": {"id": 0},
+                "lines": None,
+                "title": dialog_id,
+                "chat_id": None,
+                "chat": None,
+            })
+
     cursor = dict(portal.last_message_cursor)
     new_messages: list[FetchedMessage] = []
+    trace_map: dict[str, dict] = {}
 
     for item in items:
         dialog_id = str(item.get("id"))
+        is_open_line = item.get("lines") is not None
+        tr = trace_map.setdefault(
+            dialog_id,
+            {
+                "dialog_id": dialog_id,
+                "kind": "open_line" if is_open_line else "chat",
+                "first_seen": False,
+                "found": 0,
+            },
+        )
         last_message = item.get("message") or {}
         last_id_in_recent = int(last_message.get("id", 0))
-        is_open_line = item.get("lines") is not None
 
         if dialog_id not in cursor:
-            # Диалог видим впервые — не тянем историю, запоминаем точку старта.
+            tr["first_seen"] = True
+            logger.info(
+                "Портал #%s (%s): диалог %s впервые (кой старт), recent_last=%s",
+                portal.id, portal.domain, dialog_id, last_id_in_recent,
+            )
+            # Диалог видим впервые. Раньше мы молча фиксировали «точку старта»
+            # и НЕ пересылали уже накопившиеся входящие — из-за этого первое
+            # входящее, пришедшее до первого опроса, терялось (курсор вставал на
+            # его id). Применяем это и к обычным диалогам, и к ОТКРЫТЫМ ЛИНИЯМ
+            # (пользователь отправляет тестовые сообщения клиентом открытой
+            # линии из Telegram — без фикса первое такое сообщение теряется):
+            # при первом появлении пересылаем последние ВХОДЯЩИЕ (не-свои).
+            if not is_open_line:
+                # Только НЕПРОЧИТАННЫЕ входящие — не выгружаем прочитанную
+                # историю, но и не теряем первое новое сообщение (см.
+                # _fetch_regular_dialog_messages, only_unread).
+                incoming_init = await _fetch_regular_dialog_messages(
+                    portal, dialog_id, 0, only_unread=True
+                )
+                tr["found"] = len(incoming_init)
+                logger.info(
+                    "Портал #%s (%s): first-seen диалога %s, найдено входящих=%s, ставим курсор",
+                    portal.id, portal.domain, dialog_id, len(incoming_init),
+                )
+            else:
+                chat_id = item.get("chat_id") or (item.get("chat") or {}).get("id")
+                if chat_id is not None:
+                    incoming_init = await _fetch_open_line_messages(portal, dialog_id, chat_id, 0)
+                    # У открытой линии нет unread — чтобы не обвалить прочитанную
+                    # историю, пересылаем только сообщения ПОСЛЕ подключения
+                    # портала, но не теряем первое новое после подключения.
+                    incoming_init = [
+                        m for m in incoming_init
+                        if _is_on_or_after_connect(m.date, portal.created_at)
+                    ]
+                else:
+                    logger.warning(
+                        "Портал #%s (%s): открытая линия %s без chat_id — пропуск first-seen",
+                        portal.id, portal.domain, dialog_id,
+                    )
+                    incoming_init = []
+                tr["found"] = len(incoming_init)
+                logger.info(
+                    "Портал #%s (%s): first-seen открытой линии %s (chat_id=%s), "
+                    "найдено входящих=%s, ставим курсор",
+                    portal.id, portal.domain, dialog_id, chat_id, len(incoming_init),
+                )
+            if incoming_init:
+                new_max = max(m.message_id for m in incoming_init)
+                cursor[dialog_id] = str(max(new_max, last_id_in_recent))
+                title = item.get("title") or dialog_id
+                for m in incoming_init:
+                    m.dialog_title = title
+                new_messages.extend(incoming_init)
+                continue
             cursor[dialog_id] = str(last_id_in_recent)
             continue
 
@@ -247,7 +387,10 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
             chat_id = item.get("chat_id") or (item.get("chat") or {}).get("id")
             dialog_messages = await _fetch_open_line_messages(portal, dialog_id, chat_id, known_last_id)
         else:
+            # Для уже известных диалогов пересылаем все новые входящие
+            # (включая прочитанные), исключая собственные исходящие сотрудника.
             dialog_messages = await _fetch_regular_dialog_messages(portal, dialog_id, known_last_id)
+        tr["found"] = len(dialog_messages)
 
         if dialog_messages:
             new_max_id = max(m.message_id for m in dialog_messages)
@@ -258,5 +401,25 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
             new_messages.extend(dialog_messages)
         else:
             cursor[dialog_id] = str(last_id_in_recent)
+
+    trace_list = []
+    for entry in trace_map.values():
+        entry["cursor"] = cursor.get(entry["dialog_id"])
+        trace_list.append(entry)
+
+    # Сохраняем трассу цикла для экрана «Диагностика» (не роняем опрос,
+    # если запись в БД не удалась).
+    try:
+        await save_portal_diagnostics(
+            portal.id,
+            portal.owner_user_id,
+            {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "recent_items": len(items),
+                "trace": trace_list,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Портал #%s (%s): не удалось сохранить диагностику опроса", portal.id, portal.domain)
 
     return new_messages, cursor

@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS cleanup_notices (
 
 CREATE INDEX IF NOT EXISTS idx_cleanup_notices_owner
     ON cleanup_notices (owner_user_id);
+
+-- Диагностика опроса порталов (одна строка на портал — трасса последнего
+-- цикла). Нужна, чтобы без прод-логов видеть, что нашёл опрос в каждый цикл
+-- и почему то или иное сообщение не переслалось (см. виджет «Диагностика»).
+CREATE TABLE IF NOT EXISTS portal_diagnostics (
+    portal_id   INTEGER PRIMARY KEY,
+    owner_user_id INTEGER NOT NULL,
+    payload     TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_portal_diagnostics_owner
+    ON portal_diagnostics (owner_user_id);
 """
 
 

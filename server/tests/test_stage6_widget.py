@@ -127,6 +127,14 @@ class TestWidgetIndex:
         assert f"V {version}" in html
         assert "__APP_VERSION__" not in html
 
+    def test_debug_page_served_and_has_shards(self, client):
+        """Страница «Диагностика» отдаётся по /debug и содержит опорные элементы
+        для JS (экран читает /api/portals/diagnostics)."""
+        resp = client.get("/debug")
+        assert resp.status_code == 200
+        assert "Диагностика" in resp.text
+        assert "/api/portals/diagnostics" in resp.text
+
     def test_widget_handles_all_status_values(self, client):
         """PortalStatus = Literal["connecting", "active", "error", "disabled"] — все должны быть отрисовываемы."""
         html = client.get("/").text

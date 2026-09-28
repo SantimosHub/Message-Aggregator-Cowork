@@ -221,6 +221,16 @@ class TestConnectPortalWebhook:
             ).json()
             data = _wait_for_status(client, second["id"])
 
+            # Фоновая задача подключения (finish_connecting) шлёт приветствие
+            # асинхронно и может не успеть к моменту status=active — даём ей
+            # время, прогоняя обработку цикла лёгкими запросами.
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if any("two.ru" in c.args[1] for c in send.call_args_list):
+                    break
+                client.get("/api/portals")
+                time.sleep(0.15)
+
         assert data["status"] == "active"
         assert data["main_chat_id"] == 777  # тот же общий чат
         # Второй портал НЕ создаёт новый чат — переиспользует существующий
