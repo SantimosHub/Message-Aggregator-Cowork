@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -65,6 +66,12 @@ logger = logging.getLogger("message_aggregator.external_fetcher")
 _employee_name_cache: dict[tuple[int, str], str] = {}
 _EMPLOYEE_CACHE_MAX = 2000
 
+# Название каждого диалога открытой линии ((portal_id, dialog_id) -> name).
+# Его запрашиваем один раз (имя клиента в нём почти не меняется), чтобы не
+# долбить портал на каждом цикле.
+_open_line_dialog_cache: dict[tuple[int, str], str] = {}
+_OPEN_LINE_DIALOG_CACHE_MAX = 2000
+
 
 def _split_open_line_client(text: str) -> tuple[Optional[str], str]:
     """
@@ -78,12 +85,23 @@ def _split_open_line_client(text: str) -> tuple[Optional[str], str]:
     только одна строка (вторая строки нет) — подпись не отделить, возвращаем
     (None, исходный текст), и в дайджесте остаётся «Клиент».
     """
-    line, _, rest = text.partition("\n")
+    stripped = text.strip()
+    # 1) Двухстрочный формат: первая строка — подпись клиента, остальное — текст.
+    line, _, rest = stripped.partition("\n")
     line = line.strip()
     rest = rest.strip()
-    if not line or not rest or len(line) > 80:
-        return None, text
-    return line, rest
+    if line and rest and len(line) <= 80:
+        return line, rest
+    # 2) Однострочный формат «Имя: текст» (например «Тест Олег: десятый тест» —
+    # имя до первого двоеточия, далее сам текст). НЕ ловим URL (https://…),
+    # т.к. после двоеточия там нет пробела/текста в нашей маске.
+    match = re.match(r"^([^:\r\n]{1,60}?):[ \t]+(.+)$", stripped)
+    if match:
+        name = match.group(1).strip()
+        rest = match.group(2).strip()
+        if name and rest:
+            return name, rest
+    return None, text
 
 
 class ExternalPortalApiError(Exception):
@@ -207,6 +225,12 @@ async def _fetch_open_line_messages(
 ) -> list[FetchedMessage]:
     result = await _call_method(portal, "imopenlines.session.history.get", {"CHAT_ID": chat_id})
     message_map = result.get("message", {}) if isinstance(result, dict) else {}
+    # В ответе истории есть словарь users: {"<id>": {"name": "Имя", ...}} —
+    # имя отправителя, включая КЛИЕНТА открытой линии (пользователя коннектора).
+    # Это самый надёжный источник имени (в отличие от текста/названия диалога).
+    users_map = result.get("users", {}) if isinstance(result, dict) else {}
+    if not isinstance(users_map, dict):
+        users_map = {}
 
     # Собираем имена сотрудников внешнего портала, чьи сообщения попадают в
     # открытую линию (коллеги-операторы). В истории открытой линии нет имени,
@@ -218,6 +242,9 @@ async def _fetch_open_line_messages(
         if msg.get("senderid") is not None and str(msg.get("senderid")) != "0"
     }
     employee_names = await _fetch_employee_names(portal, sender_ids)
+    # Имя клиента из названия диалога (на случай, если в тексте префикса нет) —
+    # берём один раз на диалог.
+    dialog_client_name = await _fetch_open_line_dialog_name(portal, dialog_id)
 
     fetched = []
     for msg_id_str, msg in message_map.items():
@@ -240,7 +267,26 @@ async def _fetch_open_line_messages(
             continue
         sender = str(msg.get("senderid")) if msg.get("senderid") is not None else None
         employee_name = employee_names.get(sender) if sender else None
-        client_name, cleaned_text = _split_open_line_client(msg.get("text", ""))
+        raw_text = msg.get("text", "") or ""
+        client_name, cleaned_text = _split_open_line_client(raw_text)
+        history_user = users_map.get(sender) if sender else None
+        history_name = history_user.get("name") if isinstance(history_user, dict) else None
+        if client_name:
+            author_name = client_name
+            final_text = cleaned_text
+        elif history_name:
+            # Имя отправителя из ответа истории (сотрудник или клиент-коннектор).
+            author_name = history_name
+            final_text = raw_text
+        elif employee_name:
+            author_name = employee_name
+            final_text = raw_text
+        elif dialog_client_name:
+            author_name = dialog_client_name
+            final_text = raw_text
+        else:
+            author_name = "Клиент"
+            final_text = raw_text
         fetched.append(
             FetchedMessage(
                 dialog_id=dialog_id,
@@ -248,14 +294,15 @@ async def _fetch_open_line_messages(
                 is_open_line=True,
                 message_id=msg_id,
                 author_id=sender,
-                # Имя автора отдаём в порядке приоритета:
-                #   1) сотрудник внешнего портала (коллега-оператор) — из user.get;
-                #   2) клиент — префикс из начала текста (в любом формате);
-                #   3) иначе — нейтральное «Клиент».
-                author_name=employee_name or client_name or "Клиент",
-                # Префикс-подпись клиента вырезаем из текста только тогда,
-                # когда она использована как имя. Для сотрудников текст не трогаем.
-                text=cleaned_text if not employee_name else msg.get("text", ""),
+                # Имя автора в порядке приоритета:
+                #   1) сотрудник внешнего портала (коллега) — user.get;
+                #   2) клиент — префикс из начала текста;
+                #   3) клиент — имя из названия диалога (из лида/контакта);
+                #   4) нейтральное «Клиент».
+                author_name=author_name,
+                # Префикс-подпись вырезаем из текста только тогда, когда он
+                # реально использован как имя (взят из текста).
+                text=final_text,
                 date=msg.get("date", ""),
             )
         )
@@ -314,6 +361,51 @@ async def _fetch_employee_names(portal: ExternalPortal, sender_ids: set[str]) ->
             if len(_employee_name_cache) < _EMPLOYEE_CACHE_MAX:
                 _employee_name_cache[(portal.id, uid)] = full
     return names
+
+
+def _clean_open_line_client_from_name(raw: Optional[str]) -> Optional[str]:
+    """
+    Из названия диалога открытой линии достаёт человеко-понятное имя клиента.
+    Bitrix24 часто кладёт имя в название чата: «Т: Тест Олег - Открытая линия»
+    или «... группа ... - Ульяна». Правила:
+      - если есть префикс «Т: » — берём имя сразу после него (до первого « - »);
+      - иначе берём последнюю часть после « - » (клиент обычно в конце);
+      - не вышло — возвращаем None.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if re.match(r"^[ТT]:\s*", s):
+        s = re.sub(r"^[ТT]:\s*", "", s)
+        s = re.split(r"\s+-\s+", s)[0]
+    else:
+        parts = re.split(r"\s+-\s+", s)
+        s = parts[-1]
+    s = s.strip()
+    return s or None
+
+
+async def _fetch_open_line_dialog_name(portal: ExternalPortal, dialog_id: str) -> Optional[str]:
+    """Имя клиента открытой линии из названия диалога (imopenlines.dialog.get).
+    Fail-safe и с таймаутом, чтобы не блокировать опрос; кешируется один раз."""
+    key = (portal.id, dialog_id)
+    if key in _open_line_dialog_cache:
+        return _open_line_dialog_cache[key]
+    name: Optional[str] = None
+    try:
+        res = await asyncio.wait_for(
+            _call_method(portal, "imopenlines.dialog.get", {"DIALOG_ID": dialog_id}),
+            timeout=6,
+        )
+        if isinstance(res, dict):
+            result = res.get("result") or {}
+            if isinstance(result, dict):
+                name = result.get("name")
+    except (ExternalPortalApiError, Exception):  # noqa: BLE001
+        name = None
+    if name:
+        _open_line_dialog_cache[key] = name
+    return _clean_open_line_client_from_name(name)
 
 
 def _is_on_or_after_connect(date_str: Optional[str], created_at: Optional[str]) -> bool:
