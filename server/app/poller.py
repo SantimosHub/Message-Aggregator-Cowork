@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from datetime import datetime
 
 from .config import get_settings
@@ -38,6 +39,13 @@ from .vibe_client import VibeApiError, create_group_chat, delete_group_chat, sen
 logger = logging.getLogger("message_aggregator.poller")
 
 POLL_INTERVAL_SECONDS = 45  # середина диапазона 30-60 сек из PLAN.md
+
+# Пульс поллера для страницы «Диагностика»: показывает, что фоновый цикл
+# реально крутится, сколько порталов видит и не падает ли на каждом проходе.
+_poller_last_run: datetime | None = None
+_poller_active_count = 0
+_poller_connecting_count = 0
+_poller_last_error: str | None = None
 
 def _cleanup_error_reason(exc: BaseException) -> str:
     """Краткая человеко-читаемая причина сбоя удаления чата — чтобы в
@@ -226,7 +234,7 @@ async def finish_disconnect_chats(
                 "Не удалось удалить отдельный чат при отключении портала. "
                 f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Неожиданная ошибка при удалении отдельного чата %s", separate_chat_id)
             await repo.add_cleanup_notice(
                 owner_user_id,
@@ -245,7 +253,7 @@ async def finish_disconnect_chats(
                 "Не удалось удалить общий чат «Сборщик сообщений». "
                 f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Неожиданная ошибка при удалении общего чата %s", shared_chat_id)
             await repo.add_cleanup_notice(
                 owner_user_id,
@@ -309,7 +317,7 @@ async def finish_reset_chats(
                 "Сброс: не удалось удалить некоторые отдельные чаты. "
                 f"Они могут остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Сброс: неожиданная ошибка при удалении отдельного чата %s", chat_id)
             await repo.add_cleanup_notice(
                 owner_user_id,
@@ -328,7 +336,7 @@ async def finish_reset_chats(
                 "Сброс: не удалось удалить общий чат «Сборщик сообщений». "
                 f"Чат может остаться в вашем списке чатов. Причина: {_cleanup_error_reason(exc)}",
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Сброс: неожиданная ошибка при удалении общего чата %s", shared_chat_id)
             await repo.add_cleanup_notice(
                 owner_user_id,
@@ -360,6 +368,7 @@ async def _process_portal(portal: repo.ExternalPortal) -> None:
     try:
         new_messages, candidate_cursor = await fetch_new_messages(portal)
     except ExternalPortalApiError as exc:
+        await _save_poll_error(portal, exc)
         if exc.is_auth_error:
             logger.warning(
                 "Портал #%s (%s): ключ/вебхук недействителен, статус -> error: %s",
@@ -369,7 +378,8 @@ async def _process_portal(portal: repo.ExternalPortal) -> None:
         else:
             logger.warning("Портал #%s (%s): временная ошибка опроса: %s", portal.id, portal.domain, exc)
         return
-    except Exception:  # noqa: BLE001 — ошибка одного портала не должна ронять цикл
+    except Exception as exc:  # noqa: BLE001 — ошибка одного портала не должна ронять цикл
+        await _save_poll_error(portal, exc)
         logger.exception("Портал #%s (%s): неожиданная ошибка при опросе", portal.id, portal.domain)
         return
 
@@ -391,6 +401,25 @@ async def _process_portal(portal: repo.ExternalPortal) -> None:
 
     if final_cursor != portal.last_message_cursor:
         await repo.update_cursor(portal.id, final_cursor)
+
+
+async def _save_poll_error(portal: repo.ExternalPortal, exc: BaseException) -> None:
+    """Пишет в диагностику портала причину сбоя опроса, чтобы `/debug` видел
+    даже неудачные циклы (и название/домен портала — иначе падающий портал
+    «не виден» в диагностике). Не роняет обработку при сбое записи."""
+    try:
+        await repo.save_portal_diagnostics(
+            portal.id,
+            portal.owner_user_id,
+            {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "portal_domain": portal.portal_domain or portal.domain,
+                "portal_title": portal.domain,
+                "error": str(exc),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось сохранить ошибку опроса портала #%s в диагностику", portal.id)
 
 
 def _format_time(iso_date: str) -> str:
@@ -492,8 +521,12 @@ async def poll_once() -> None:
     затем опрашивает 'active' порталы на новые сообщения. Всё выполняется
     параллельно и не мешает друг другу.
     """
+    global _poller_last_run, _poller_active_count, _poller_connecting_count
     connecting = await repo.list_connecting_portals()
     active = await repo.list_active_portals()
+    _poller_connecting_count = len(connecting)
+    _poller_active_count = len(active)
+    _poller_last_run = datetime.now()
     if not connecting and not active:
         return
     await asyncio.gather(
@@ -503,10 +536,13 @@ async def poll_once() -> None:
 
 
 async def _poll_loop() -> None:
+    global _poller_last_error
     while True:
         try:
             await poll_once()
         except Exception:  # noqa: BLE001 — цикл не должен останавливаться из-за бага одного прохода
+            _exc = sys.exc_info()[1]
+            _poller_last_error = f"{type(_exc).__name__}: {_exc}"
             logger.exception("Неожиданная ошибка в цикле опроса портала")
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 

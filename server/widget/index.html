@@ -144,16 +144,6 @@
     opacity: 0.7;
     user-select: none;
   }
-  .debug-link {
-    align-self: center;
-    text-decoration: none;
-    color: var(--text-muted);
-    font-size: 12px;
-    white-space: nowrap;
-    transition: color 0.15s ease;
-  }
-  .debug-link:hover { color: var(--accent); }
-
   #notices { margin-bottom: 12px; }
   .notice {
     display: flex;
@@ -432,7 +422,6 @@
       <p>Сообщения из подключенных порталов будут приходить в отдельный чат на вашем портале.</p>
     </div>
     <button class="btn-primary" id="toggle-form-btn" type="button">+ Подключить портал</button>
-    <a class="debug-link" href="/debug">Диагностика</a>
   </div>
 
   <div id="notices"></div>
@@ -462,7 +451,7 @@
         Как создать вебхук на портале-источнике:
         <ol>
           <li>Раздел «Разработчикам» → «Другое» → «Входящий вебхук»</li>
-          <li>В разделе настройка прав выберите следующие права: <code>Чат и уведомления (im)</code> и <code>Открытые линии (imopenlines)</code></li>
+          <li>В разделе настройка прав выберите следующие права: <code>Чат и уведомления (im)</code>, <code>Открытые линии (imopenlines)</code> и <code>Пользователи (user)</code></li>
           <li>Скопируйте выданную ссылку целиком, вместе со слэшем на конце</li>
           <li>Нажмите кнопку создать</li>
         </ol>

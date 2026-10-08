@@ -194,6 +194,8 @@ class TestFetchNewMessagesOpenLine:
                 return recent
             if method == "im.counters.get":
                 return {}
+            if method == "user.get":
+                return {"result": []}
             if method == "imopenlines.session.history.get":
                 assert params["CHAT_ID"] == 2001
                 return history
@@ -239,6 +241,8 @@ class TestFetchNewMessagesOpenLine:
                 return recent
             if method == "im.counters.get":
                 return {}
+            if method == "user.get":
+                return {"result": []}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -283,6 +287,8 @@ class TestFetchNewMessagesOpenLine:
                 return recent
             if method == "im.counters.get":
                 return {}
+            if method == "user.get":
+                return {"result": []}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -317,6 +323,8 @@ class TestFetchNewMessagesOpenLine:
                 return recent
             if method == "im.counters.get":
                 return {}
+            if method == "user.get":
+                return {"result": []}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -359,6 +367,8 @@ class TestFetchNewMessagesOpenLine:
                 return recent
             if method == "im.counters.get":
                 return {}
+            if method == "user.get":
+                return {"result": []}
             if method == "imopenlines.session.history.get":
                 return history
             raise AssertionError(f"unexpected method {method}")
@@ -371,6 +381,69 @@ class TestFetchNewMessagesOpenLine:
 
         assert [m.message_id for m in messages] == [90]
         assert messages[0].text == "новое после подключения"
+
+    def test_split_open_line_client_name(self):
+        """Подпись клиента из первой строки текста (в любом формате) вставляется
+        вместо «Клиент», а сама подпись убирается из текста сообщения."""
+        from app.external_message_fetcher import _split_open_line_client
+
+        name, rest = _split_open_line_client("Ульяна (79537499677)\nИнтеллектик, здравствуйте...")
+        assert name == "Ульяна (79537499677)"
+        assert rest == "Интеллектик, здравствуйте..."
+
+        name, rest = _split_open_line_client("Денис Профиджим (79051177427)\nсейчас с аккаунта")
+        assert name == "Денис Профиджим (79051177427)"
+        assert rest == "сейчас с аккаунта"
+
+        # Однострочное сообщение — подпись отделить нечем, остаётся «Клиент»
+        name, rest = _split_open_line_client("обычный текст без имени")
+        assert name is None
+        assert rest == "обычный текст без имени"
+
+    @pytest.mark.asyncio
+    async def test_open_line_colleague_name_from_user_get(self):
+        """
+        Если в открытую линию пишет сотрудник внешнего портала (коллега-
+        оператор), в строку автора подставляется его имя из user.get, а не
+        слово «Клиент», и текст его сообщения не режется.
+        """
+        recent = {
+            "items": [
+                {
+                    "id": "chat2006",
+                    "chat_id": 2006,
+                    "type": "chat",
+                    "title": "Open line #2006",
+                    "message": {"id": 90, "text": "last"},
+                    "lines": {"id": 1, "status": 1},
+                }
+            ]
+        }
+        history = {
+            "message": {
+                "90": {"id": "90", "senderid": "501", "text": "ответ оператора коллеги", "date": "x"},
+            }
+        }
+
+        async def fake_call(portal_arg, method, params):
+            if method == "im.recent.list":
+                return recent
+            if method == "im.counters.get":
+                return {}
+            if method == "user.get":
+                assert params["ID"] == ["501"]
+                return {"result": [{"ID": 501, "NAME": "Пётр", "LAST_NAME": "Синицын"}]}
+            if method == "imopenlines.session.history.get":
+                return history
+            raise AssertionError(f"unexpected method {method}")
+
+        portal = _portal(last_message_cursor={"chat2006": "80"})
+        with patch("app.external_message_fetcher._call_method", side_effect=fake_call):
+            messages, _ = await fetch_new_messages(portal)
+
+        assert len(messages) == 1
+        assert messages[0].author_name == "Пётр Синицын"
+        assert messages[0].text == "ответ оператора коллеги"
 
 
 class TestAuthErrorPropagation:

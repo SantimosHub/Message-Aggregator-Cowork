@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_owner_user_id
+from .. import poller
 from ..poller import (
     schedule_finish_connecting,
     schedule_finish_disconnect,
@@ -162,6 +163,22 @@ async def get_my_portal_diagnostics(owner_user_id: int = Depends(get_current_own
     цикл и почему что-то не переслалось). См. save_portal_diagnostics.
     """
     return await repo.list_portal_diagnostics(owner_user_id)
+
+
+@router.get("/poll-status")
+async def get_poller_status(owner_user_id: int = Depends(get_current_owner_user_id)) -> dict:
+    """
+    Пульс фонового поллера для страницы «Диагностика»: когда последний раз
+    крутился цикл, сколько порталов видит, не падает ли на каждом проходе.
+    Показывает, работает ли опрос в принципе (а не только то, что видит
+    конкретный портал).
+    """
+    return {
+        "last_run": poller._poller_last_run.isoformat(timespec="seconds") if poller._poller_last_run else None,
+        "active_count": poller._poller_active_count,
+        "connecting_count": poller._poller_connecting_count,
+        "last_error": poller._poller_last_error,
+    }
 
 
 @router.delete("/notices", status_code=204)

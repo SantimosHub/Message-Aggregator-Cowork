@@ -154,6 +154,11 @@
   .num.zero { color: var(--alert); }
   .ok { color: var(--accent); }
   .fail { color: var(--alert); font-weight: 700; }
+  .pstatus { font-size: 11px; border-radius: 5px; padding: 1px 7px; border: 1px solid var(--line); }
+  .pstatus.active { color: var(--accent); border-color: rgba(97,217,160,0.4); }
+  .pstatus.connecting { color: var(--warn); border-color: rgba(230,180,80,0.4); }
+  .pstatus.error { color: var(--alert); border-color: rgba(255,122,107,0.4); }
+  .perr { color: var(--alert); font-size: 11.5px; }
 
   .footer { margin-top: 26px; color: var(--muted); font-size: 11.5px; opacity: .7; }
 </style>
@@ -164,6 +169,7 @@
     <h1>Диагностика <span class="dot">▍</span>опроса порталов</h1>
     <div class="actions">
       <span id="last-updated" class="status">не обновлено</span>
+      <span id="poller-status" class="status" style="max-width:420px"></span>
       <label class="autorefresh"><input type="checkbox" id="autorefresh" checked /> авто</label>
       <button class="btn" id="refresh-btn" type="button">⟳ Обновить</button>
     </div>
@@ -183,24 +189,50 @@
 
     function fmt(dialogId) { return dialogId; }
 
-    function render(rows) {
-      if (!rows || rows.length === 0) {
+    function renderPoller(pst) {
+      var el = document.getElementById("poller-status");
+      if (!el) return;
+      if (!pst) { el.textContent = "поллер: нет данных"; return; }
+      var parts = ["поллер"];
+      if (pst.last_run) parts.push("последний цикл " + pst.last_run);
+      parts.push("active=" + pst.active_count, "connecting=" + pst.connecting_count);
+      if (pst.last_error) parts.push("ошибка цикла: " + pst.last_error);
+      el.textContent = parts.join(" · ");
+    }
+
+    function render(rows, portals) {
+      var traceMap = {};
+      (rows || []).forEach(function (r) { traceMap[r.portal_id] = r; });
+
+      if (!portals || portals.length === 0) {
         bodyEl.innerHTML =
-          '<div class="empty"><div class="big">Диагностика пока пуста</div>' +
-          'Сообщений пока не было, либо порталы ещё не опрашивались. ' +
-          'Отправьте тестовое сообщение и нажмите «Обновить».</div>';
+          '<div class="empty"><div class="big">Подключённых порталов нет</div>' +
+          'Список /api/portals пуст — добавьте портал и попробуйте снова.</div>';
         hintEl.textContent = "";
         return;
       }
 
-      var html = rows.map(function (r) {
+      var html = portals.map(function (p) {
+        var r = traceMap[p.id] || {};
         var tr = r.trace || {};
         var trace = tr.trace || [];
         var ts = r.updated_at || tr.generated_at || "—";
         var recent = tr.recent_items;
+        var domain = p.portal_domain || p.domain || "";
+        var namePart = p.domain ? " (" + p.domain + ")" : "";
+        var st = p.status || "unknown";
+        var statusHtml = '<span class="pstatus ' + st + '">' + st + '</span>';
+        var errHtml = (p.error_message ? '<div class="perr">ошибка: ' + p.error_message + '</div>' : (tr.error ? '<div class="perr">ошибка опроса: ' + tr.error + '</div>' : ""));
+
         var meta =
           '<div class="meta">' +
           '<span>диалогов в опросе: <span class="k">' + (recent === undefined ? "—" : recent) + '</span></span>' +
+          '<span>recent в выдаче: <span class="k">' + ((tr.recent_raw_ids || []).length) + '</span></span>' +
+          '<span>счётчики D/C/L: <span class="k">' +
+            (tr.counters
+              ? tr.counters.DIALOG + "/" + tr.counters.CHAT + "/" + tr.counters.LINES
+              : "—") +
+          '</span></span>' +
           '<span>всего записей в трассе: <span class="k">' + trace.length + '</span></span>' +
           '</div>';
 
@@ -214,25 +246,26 @@
             : '<span class="tag">чат</span>';
           return (
             '<tr>' +
-            '<td class="dlg">' + fmt(d.dialog_id) + '</td>' +
+            '<td class="dlg">' + d.dialog_id + '</td>' +
             '<td>' + kind + ' ' + fs + '</td>' +
             '<td class="' + (found > 0 ? "num" : "num zero") + '">' + found + '</td>' +
             '<td class="num">' + (d.cursor === undefined ? "—" : d.cursor) + '</td>' +
             '</tr>'
           );
         }).join("");
+        var table = trace.length
+          ? '<table><thead><tr><th>Диалог</th><th>Тип</th><th>Найдено входящих</th><th>Курсор</th></tr></thead><tbody>' + rowsHtml + '</tbody></table>'
+          : '<div style="padding:10px 16px;color:var(--muted)">Нет данных опроса по этому порталу.</div>';
 
         return (
           '<div class="portal">' +
           '<div class="portal-head">' +
           '<span class="pbadge">портал</span>' +
-          '<span class="pid">#' + r.portal_id + '</span>' +
+          '<span class="pid">#' + p.id + '</span>' +
+          (domain ? '<span class="pid" style="color:var(--accent)">' + domain + namePart + '</span>' : '') +
+          statusHtml +
           '<span class="ts">обновлён ' + ts + '</span>' +
-          '</div>' + meta +
-          '<table><thead><tr>' +
-          '<th>Диалог</th><th>Тип</th><th>Найдено входящих</th><th>Курсор</th>' +
-          '</tr></thead><tbody>' + rowsHtml +
-          '</tbody></table>' +
+          '</div>' + errHtml + meta + table +
           '</div>'
         );
       }).join("");
@@ -244,13 +277,14 @@
     }
 
     function load() {
-      fetch(API, { credentials: "same-origin" })
-        .then(function (resp) {
-          if (!resp.ok) throw new Error("HTTP " + resp.status);
-          return resp.json();
-        })
-        .then(function (rows) {
-          render(rows);
+      Promise.all([
+        fetch(API, { credentials: "same-origin" }).then(function (r) { return r.ok ? r.json() : []; }),
+        fetch("/api/portals", { credentials: "same-origin" }).then(function (r) { return r.ok ? r.json() : []; }),
+        fetch("/api/portals/poll-status", { credentials: "same-origin" }).then(function (r) { return r.ok ? r.json() : {}; })
+      ])
+        .then(function (parts) {
+          render(parts[0], parts[1]);
+          renderPoller(parts[2]);
           upEl.textContent = "обновлено " + new Date().toLocaleTimeString();
         })
         .catch(function (err) {

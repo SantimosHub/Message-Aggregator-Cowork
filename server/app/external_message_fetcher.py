@@ -58,6 +58,33 @@ from .repositories.external_portals import ExternalPortal, save_portal_diagnosti
 
 logger = logging.getLogger("message_aggregator.external_fetcher")
 
+# Кеш имён сотрудников внешних порталов (portal_id, user_id) -> имя. Полное имя
+# пользователя на портале практически не меняется, поэтому запрашивается один
+# раз, а не на каждом цикле опроса — иначе на порталах с большим числом линий
+# user.get в каждом цикле мог блокировать/тормозить опрос.
+_employee_name_cache: dict[tuple[int, str], str] = {}
+_EMPLOYEE_CACHE_MAX = 2000
+
+
+def _split_open_line_client(text: str) -> tuple[Optional[str], str]:
+    """
+    Вычленяет префикс клиента открытой линии из начала текста сообщения.
+
+    В чатах открытых линий сообщение клиента часто начинается с подписи
+    «Имя (телефон)» или просто «Имя …», за которой идёт сам текст. Мы
+    ВСЕГДА берём первую строку как такую подпись (в любом формате) и
+    подставляем её в строку автора дайджеста вместо слова «Клиент», а из
+    самого текста префикс убираем, чтобы не дублировался. Если у сообщения
+    только одна строка (вторая строки нет) — подпись не отделить, возвращаем
+    (None, исходный текст), и в дайджесте остаётся «Клиент».
+    """
+    line, _, rest = text.partition("\n")
+    line = line.strip()
+    rest = rest.strip()
+    if not line or not rest or len(line) > 80:
+        return None, text
+    return line, rest
+
 
 class ExternalPortalApiError(Exception):
     """Ошибка при опросе внешнего портала — авторизационная или сетевая."""
@@ -181,6 +208,17 @@ async def _fetch_open_line_messages(
     result = await _call_method(portal, "imopenlines.session.history.get", {"CHAT_ID": chat_id})
     message_map = result.get("message", {}) if isinstance(result, dict) else {}
 
+    # Собираем имена сотрудников внешнего портала, чьи сообщения попадают в
+    # открытую линию (коллеги-операторы). В истории открытой линии нет имени,
+    # только senderid — поэтому отдельно запрашиваем user.get. Клиенты (не
+    # пользователи портала) в этот словарь не попадут, их имя берём из текста.
+    sender_ids = {
+        str(msg.get("senderid"))
+        for msg in message_map.values()
+        if msg.get("senderid") is not None and str(msg.get("senderid")) != "0"
+    }
+    employee_names = await _fetch_employee_names(portal, sender_ids)
+
     fetched = []
     for msg_id_str, msg in message_map.items():
         msg_id = int(msg_id_str)
@@ -200,23 +238,82 @@ async def _fetch_open_line_messages(
         # сохранённому при подключении портала (см. docstring модуля).
         if portal.owner_external_user_id and str(msg.get("senderid")) == portal.owner_external_user_id:
             continue
+        sender = str(msg.get("senderid")) if msg.get("senderid") is not None else None
+        employee_name = employee_names.get(sender) if sender else None
+        client_name, cleaned_text = _split_open_line_client(msg.get("text", ""))
         fetched.append(
             FetchedMessage(
                 dialog_id=dialog_id,
                 dialog_title=dialog_id,
                 is_open_line=True,
                 message_id=msg_id,
-                author_id=str(msg.get("senderid")) if msg.get("senderid") is not None else None,
-                # Отдельного человекочитаемого имени клиента открытой линии в
-                # imopenlines.session.history.get нет (только числовой senderid),
-                # поэтому вместо сырого id показываем понятную пометку «Клиент»
-                # — название самого чата линии выводится в шапке дайджеста.
-                author_name="Клиент",
-                text=msg.get("text", ""),
+                author_id=sender,
+                # Имя автора отдаём в порядке приоритета:
+                #   1) сотрудник внешнего портала (коллега-оператор) — из user.get;
+                #   2) клиент — префикс из начала текста (в любом формате);
+                #   3) иначе — нейтральное «Клиент».
+                author_name=employee_name or client_name or "Клиент",
+                # Префикс-подпись клиента вырезаем из текста только тогда,
+                # когда она использована как имя. Для сотрудников текст не трогаем.
+                text=cleaned_text if not employee_name else msg.get("text", ""),
                 date=msg.get("date", ""),
             )
         )
     return fetched
+
+
+async def _fetch_employee_names(portal: ExternalPortal, sender_ids: set[str]) -> dict[str, str]:
+    """Имена сотрудников внешнего портала по их ID (senderid сообщений открытой
+    линии), через user.get, с кешированием и строгим таймаутом, чтобы user.get
+    НЕ блокировал опрос (на порталах со множеством линий это вставало). Клиенты
+    (внешние контакты) в результат не попадут; при ошибке — частичный/пустой.
+    """
+    ids = [sid for sid in sender_ids if sid]
+    if not ids:
+        return {}
+
+    names: dict[str, str] = {}
+    missing: list[str] = []
+    for sid in ids:
+        cached = _employee_name_cache.get((portal.id, sid))
+        if cached:
+            names[sid] = cached
+        else:
+            missing.append(sid)
+    if not missing:
+        return names
+
+    try:
+        res = await asyncio.wait_for(
+            _call_method(portal, "user.get", {"ID": missing}),
+            timeout=6,
+        )
+    except (ExternalPortalApiError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+        # user.get — вторичная опция (имена). Любой сбой не должен останавливать
+        # или задерживать пересылку сообщений.
+        return names
+
+    # user.get возвращает result списком пользователей напрямую (а не словарь с
+    # ключом "result"), поэтому НЕЛЬЗЯ без проверки звать .get — это роняло весь
+    # опрос портала ('list' object has no attribute 'get').
+    if isinstance(res, dict):
+        users = res.get("result") or res.get("users") or []
+    elif isinstance(res, list):
+        users = res
+    else:
+        return names
+    if isinstance(users, dict):
+        users = [users]
+    for u in users:
+        if not isinstance(u, dict):
+            continue
+        uid = str(u.get("ID") or "")
+        full = " ".join(filter(None, [u.get("NAME"), u.get("LAST_NAME")])).strip()
+        if uid and full:
+            names[uid] = full
+            if len(_employee_name_cache) < _EMPLOYEE_CACHE_MAX:
+                _employee_name_cache[(portal.id, uid)] = full
+    return names
 
 
 def _is_on_or_after_connect(date_str: Optional[str], created_at: Optional[str]) -> bool:
@@ -264,11 +361,16 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
             "SKIP_OPENLINES": "N",
             "SKIP_DIALOG": "N",
             "SKIP_CHAT": "N",
-            "SKIP_UNDISTRIBUTED_OPENLINES": "Y",
+            # Нераспределённые открытые линии (напр. тестовые сообщения через
+            # виджет, которым ещё не назначен оператор) тоже нужно обрабатывать —
+            # иначе их сообщения не пересылаются. SKIP_UNDISTRIBUTED_OPENLINES
+            # в Y скрывало такие линии из выборки.
+            "SKIP_UNDISTRIBUTED_OPENLINES": "N",
             "LIMIT": 200,
         },
     )
     items = result.get("items", []) if isinstance(result, dict) else []
+    recent_raw_ids = [str(it.get("id")) for it in items][:25]
 
     # im.recent.list НЕ отдаёт «спящие» непрочитанные диалоги (те, куда сообщения
     # пришли, пока пользователь не заходил на портал) — из-за этого сообщения
@@ -279,27 +381,51 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
     except ExternalPortalApiError:
         counters = {}
     counters_data = counters if isinstance(counters, dict) else {}
-    unread_dialog_ids = {}
+    counters_summary = {
+        "DIALOG": len(counters_data.get("DIALOG") or {}),
+        "CHAT": len(counters_data.get("CHAT") or {}),
+        "LINES": len(counters_data.get("LINES") or {}),
+    }
+    # dialog_id -> chat_id (для открытых линий нужен chat_id; для диалогов/чатов None)
+    unread_dialog_ids: dict[str, int | None] = {}
     for cid, cnt in (counters_data.get("DIALOG") or {}).items():
         if cnt:
-            unread_dialog_ids[str(cid)] = True
+            unread_dialog_ids[str(cid)] = None
     for chat_id, cnt in (counters_data.get("CHAT") or {}).items():
         if cnt:
-            unread_dialog_ids["chat" + str(chat_id)] = True
+            unread_dialog_ids["chat" + str(chat_id)] = None
+    # Открытые линии с непрочитанными (LINES). Ключ счётчика обычно числовой
+    # chat_id открытой линии — превращаем в dialog_id "chat<N>"; если ключ уже
+    # строковый с префиксом — используем как есть (а chat_id тогда неизвестен).
+    for line_key, cnt in (counters_data.get("LINES") or {}).items():
+        if not cnt:
+            continue
+        if str(line_key).isdigit():
+            chat_id = int(line_key)
+            unread_dialog_ids["chat" + str(chat_id)] = chat_id
+        else:
+            key = str(line_key)
+            if key not in unread_dialog_ids:
+                unread_dialog_ids[key] = None
     seen_ids = {str(it.get("id")) for it in items}
-    for dialog_id in unread_dialog_ids:
+    for dialog_id, chat_id in unread_dialog_ids.items():
         if dialog_id not in seen_ids:
             # Минимальная запись-заглушка: тип/заголовок узнаем из самих сообщений
             # (im.dialog.messages.get), а last_id неизвестен (0) — курсор при
             # первом появлении установится по фактически пересланным сообщениям.
-            items.append({
+            stub = {
                 "id": dialog_id,
                 "message": {"id": 0},
-                "lines": None,
                 "title": dialog_id,
                 "chat_id": None,
                 "chat": None,
-            })
+            }
+            if dialog_id.startswith("chat") and chat_id is not None:
+                stub["chat_id"] = chat_id
+                stub["lines"] = {"id": 1, "status": 1}  # маркер открытой линии
+            else:
+                stub["lines"] = None
+            items.append(stub)
 
     cursor = dict(portal.last_message_cursor)
     new_messages: list[FetchedMessage] = []
@@ -416,6 +542,10 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
             {
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
                 "recent_items": len(items),
+                "recent_raw_ids": recent_raw_ids,
+                "counters": counters_summary,
+                "portal_domain": portal.portal_domain or portal.domain,
+                "portal_title": portal.domain,
                 "trace": trace_list,
             },
         )
