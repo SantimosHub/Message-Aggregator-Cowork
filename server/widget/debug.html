@@ -222,6 +222,9 @@
         var namePart = p.domain ? " (" + p.domain + ")" : "";
         var st = p.status || "unknown";
         var statusHtml = '<span class="pstatus ' + st + '">' + st + '</span>';
+        var tbHtml = (tr.traceback
+          ? '<details style="color:var(--muted);font-size:10.5px;padding:0 16px 6px"><summary>traceback</summary><pre style="white-space:pre-wrap;overflow:auto;max-height:220px">' + tr.traceback.replace(/</g, "&lt;") + '</pre></details>'
+          : "");
         var errHtml = (p.error_message ? '<div class="perr">ошибка: ' + p.error_message + '</div>' : (tr.error ? '<div class="perr">ошибка опроса: ' + tr.error + '</div>' : ""));
 
         var meta =
@@ -244,13 +247,28 @@
           var kind = d.kind === "open_line"
             ? '<span class="tag lines">открытая линия</span>'
             : '<span class="tag">чат</span>';
+          var srcDet = "";
+          if (d.kind === "open_line" && d.author_sources && d.author_sources.length) {
+            srcDet =
+              '<tr><td colspan="4" style="color:var(--muted);font-size:10.5px;line-height:1.6">' +
+              d.author_sources.map(function (a) {
+                return "#" + a.msg_id +
+                  " sender=" + (a.sender === undefined ? "—" : a.sender) +
+                  " users=" + (a.users_name || "—") +
+                  " pref=" + (a.client_prefix || "—") +
+                  " emp=" + (a.employee || "—") +
+                  " dialog=" + (a.dialog_name || "—") +
+                  " → выбран: <b style='color:var(--txt)'>" + (a.chosen || "—") + "</b>";
+              }).join("<br>") +
+              '</td></tr>';
+          }
           return (
             '<tr>' +
             '<td class="dlg">' + d.dialog_id + '</td>' +
             '<td>' + kind + ' ' + fs + '</td>' +
             '<td class="' + (found > 0 ? "num" : "num zero") + '">' + found + '</td>' +
             '<td class="num">' + (d.cursor === undefined ? "—" : d.cursor) + '</td>' +
-            '</tr>'
+            '</tr>' + srcDet
           );
         }).join("");
         var table = trace.length
@@ -265,7 +283,7 @@
           (domain ? '<span class="pid" style="color:var(--accent)">' + domain + namePart + '</span>' : '') +
           statusHtml +
           '<span class="ts">обновлён ' + ts + '</span>' +
-          '</div>' + errHtml + meta + table +
+          '</div>' + errHtml + tbHtml + meta + table +
           '</div>'
         );
       }).join("");

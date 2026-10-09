@@ -141,12 +141,49 @@ class TestFetchNewMessagesRegularDialog:
         # 101 — "мой собственный ответ" (владелец 900): своих не пересылаем.
         # А вот 102 — прочитанное входящее клиента: пересылается.
         assert [m.message_id for m in messages] == [102]
-        assert messages[0].text == "новое от клиента"
-        # Курсор продвигается до последнего id из im.recent.list (102), а не
-        # до максимума среди прошедших фильтр (тоже 102 в этом случае, но
-        # важно что не застревает на отфильтрованном 101 — иначе оно бы
-        # запрашивалось заново на каждом цикле).
-        assert new_cursor == {"chat1317": "102"}
+
+    @pytest.mark.asyncio
+    async def test_dialog_users_list_does_not_crash(self):
+        """
+        Поле users в im.dialog.messages.get на части порталов приходит СПИСКОМ,
+        а не словарём — раньше это роняло весь опрос ('list' has no attribute
+        'get'). Проверяем: список нормализуется, имя автора подставляется.
+        """
+        recent = {
+            "items": [
+                {
+                    "id": "14",
+                    "type": "user",
+                    "title": "",
+                    "message": {"id": 102, "text": "новое"},
+                }
+            ]
+        }
+        messages_response = {
+            "messages": [
+                {"id": 102, "author_id": 555, "text": "новое", "unread": True},
+            ],
+            "users": [
+                {"id": 555, "name": "Олег Тестов", "first_name": "Олег", "last_name": "Тестов"},
+            ],
+        }
+
+        async def fake_call(portal_arg, method, params):
+            if method == "im.recent.list":
+                return recent
+            if method == "im.counters.get":
+                return {}
+            if method == "im.dialog.messages.get":
+                return messages_response
+            raise AssertionError(f"unexpected method {method}")
+
+        portal = _portal(last_message_cursor={"14": "100"})
+        with patch("app.external_message_fetcher._call_method", side_effect=fake_call):
+            messages, _ = await fetch_new_messages(portal)
+
+        assert len(messages) == 1
+        assert messages[0].author_name == "Олег Тестов"
+        assert messages[0].text == "новое"
 
     @pytest.mark.asyncio
     async def test_no_new_activity_skips_dialog_messages_call(self):

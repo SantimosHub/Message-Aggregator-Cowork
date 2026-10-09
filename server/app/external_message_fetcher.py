@@ -175,12 +175,30 @@ def _author_display_name(user_id, users_map: dict) -> str:
     return name or user.get("name") or f"Пользователь #{user_id}"
 
 
+def _coerce_users_map(raw) -> dict:
+    """Приводит поле `users` ответа к словарю {id_строка: объект}. На разных
+    порталах/версиях API оно может быть dict {id: {...}} ИЛИ list [...]:
+    во втором случае нормализуем по ключу id/ID. Иначе — пустой словарь."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        out: dict = {}
+        for u in raw:
+            if not isinstance(u, dict):
+                continue
+            uid = str(u.get("id") or u.get("ID") or "")
+            if uid:
+                out[uid] = u
+        return out
+    return {}
+
+
 async def _fetch_regular_dialog_messages(
     portal: ExternalPortal, dialog_id: str, after_id: int, *, only_unread: bool = False
 ) -> list[FetchedMessage]:
     result = await _call_method(portal, "im.dialog.messages.get", {"DIALOG_ID": dialog_id, "LIMIT": 50})
     messages = result.get("messages", []) if isinstance(result, dict) else []
-    users_map = result.get("users", {}) if isinstance(result, dict) else {}
+    users_map = _coerce_users_map(result.get("users") if isinstance(result, dict) else {})
 
     fetched = []
     for msg in messages:
@@ -222,15 +240,13 @@ async def _fetch_regular_dialog_messages(
 
 async def _fetch_open_line_messages(
     portal: ExternalPortal, dialog_id: str, chat_id: int, after_id: int
-) -> list[FetchedMessage]:
+) -> tuple[list[FetchedMessage], list[dict]]:
     result = await _call_method(portal, "imopenlines.session.history.get", {"CHAT_ID": chat_id})
     message_map = result.get("message", {}) if isinstance(result, dict) else {}
     # В ответе истории есть словарь users: {"<id>": {"name": "Имя", ...}} —
     # имя отправителя, включая КЛИЕНТА открытой линии (пользователя коннектора).
     # Это самый надёжный источник имени (в отличие от текста/названия диалога).
-    users_map = result.get("users", {}) if isinstance(result, dict) else {}
-    if not isinstance(users_map, dict):
-        users_map = {}
+    users_map = _coerce_users_map(result.get("users") if isinstance(result, dict) else {})
 
     # Собираем имена сотрудников внешнего портала, чьи сообщения попадают в
     # открытую линию (коллеги-операторы). В истории открытой линии нет имени,
@@ -247,6 +263,7 @@ async def _fetch_open_line_messages(
     dialog_client_name = await _fetch_open_line_dialog_name(portal, dialog_id)
 
     fetched = []
+    author_sources: list[dict] = []
     for msg_id_str, msg in message_map.items():
         msg_id = int(msg_id_str)
         if msg_id <= after_id:
@@ -287,6 +304,17 @@ async def _fetch_open_line_messages(
         else:
             author_name = "Клиент"
             final_text = raw_text
+        author_sources.append(
+            {
+                "msg_id": msg_id,
+                "sender": sender,
+                "users_name": history_name,
+                "client_prefix": client_name,
+                "employee": employee_name,
+                "dialog_name": dialog_client_name,
+                "chosen": author_name,
+            }
+        )
         fetched.append(
             FetchedMessage(
                 dialog_id=dialog_id,
@@ -306,7 +334,7 @@ async def _fetch_open_line_messages(
                 date=msg.get("date", ""),
             )
         )
-    return fetched
+    return fetched, author_sources
 
 
 async def _fetch_employee_names(portal: ExternalPortal, sender_ids: set[str]) -> dict[str, str]:
@@ -566,7 +594,7 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
             else:
                 chat_id = item.get("chat_id") or (item.get("chat") or {}).get("id")
                 if chat_id is not None:
-                    incoming_init = await _fetch_open_line_messages(portal, dialog_id, chat_id, 0)
+                    incoming_init, author_sources = await _fetch_open_line_messages(portal, dialog_id, chat_id, 0)
                     # У открытой линии нет unread — чтобы не обвалить прочитанную
                     # историю, пересылаем только сообщения ПОСЛЕ подключения
                     # портала, но не теряем первое новое после подключения.
@@ -574,6 +602,9 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
                         m for m in incoming_init
                         if _is_on_or_after_connect(m.date, portal.created_at)
                     ]
+                    remaining_ids = {m.message_id for m in incoming_init}
+                    author_sources = [a for a in author_sources if a["msg_id"] in remaining_ids]
+                    tr["author_sources"] = author_sources
                 else:
                     logger.warning(
                         "Портал #%s (%s): открытая линия %s без chat_id — пропуск first-seen",
@@ -603,7 +634,8 @@ async def fetch_new_messages(portal: ExternalPortal) -> tuple[list[FetchedMessag
 
         if is_open_line:
             chat_id = item.get("chat_id") or (item.get("chat") or {}).get("id")
-            dialog_messages = await _fetch_open_line_messages(portal, dialog_id, chat_id, known_last_id)
+            dialog_messages, author_sources = await _fetch_open_line_messages(portal, dialog_id, chat_id, known_last_id)
+            tr["author_sources"] = author_sources
         else:
             # Для уже известных диалогов пересылаем все новые входящие
             # (включая прочитанные), исключая собственные исходящие сотрудника.

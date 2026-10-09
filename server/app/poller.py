@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import traceback
 from datetime import datetime
 
 from .config import get_settings
@@ -368,7 +369,7 @@ async def _process_portal(portal: repo.ExternalPortal) -> None:
     try:
         new_messages, candidate_cursor = await fetch_new_messages(portal)
     except ExternalPortalApiError as exc:
-        await _save_poll_error(portal, exc)
+        await _save_poll_error(portal, exc, traceback.format_exc())
         if exc.is_auth_error:
             logger.warning(
                 "Портал #%s (%s): ключ/вебхук недействителен, статус -> error: %s",
@@ -379,7 +380,7 @@ async def _process_portal(portal: repo.ExternalPortal) -> None:
             logger.warning("Портал #%s (%s): временная ошибка опроса: %s", portal.id, portal.domain, exc)
         return
     except Exception as exc:  # noqa: BLE001 — ошибка одного портала не должна ронять цикл
-        await _save_poll_error(portal, exc)
+        await _save_poll_error(portal, exc, traceback.format_exc())
         logger.exception("Портал #%s (%s): неожиданная ошибка при опросе", portal.id, portal.domain)
         return
 
@@ -403,7 +404,7 @@ async def _process_portal(portal: repo.ExternalPortal) -> None:
         await repo.update_cursor(portal.id, final_cursor)
 
 
-async def _save_poll_error(portal: repo.ExternalPortal, exc: BaseException) -> None:
+async def _save_poll_error(portal: repo.ExternalPortal, exc: BaseException, tb: str | None = None) -> None:
     """Пишет в диагностику портала причину сбоя опроса, чтобы `/debug` видел
     даже неудачные циклы (и название/домен портала — иначе падающий портал
     «не виден» в диагностике). Не роняет обработку при сбое записи."""
@@ -416,6 +417,7 @@ async def _save_poll_error(portal: repo.ExternalPortal, exc: BaseException) -> N
                 "portal_domain": portal.portal_domain or portal.domain,
                 "portal_title": portal.domain,
                 "error": str(exc),
+                "traceback": (tb or "")[-2000:],
             },
         )
     except Exception:  # noqa: BLE001
